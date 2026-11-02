@@ -5,7 +5,7 @@ members = ["crates/protocol", "crates/domain", "crates/licensing", "crates/serve
 [workspace.package]
 edition = "2021"
 rust-version = "1.97"
-version = "0.1.0"
+version = "0.1.1"
 publish = false
 
 [workspace.dependencies]
