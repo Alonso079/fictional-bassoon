@@ -1,0 +1,25 @@
+[Unit]
+Description=PuniShell HTTPS server
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/punishell/server.json
+
+[Service]
+Type=simple
+User=punishell
+Group=punishell
+ExecStart=/usr/local/bin/punishell-server serve --config /var/lib/punishell/server.json
+WorkingDirectory=/var/lib/punishell
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/punishell
+
+[Install]
+WantedBy=multi-user.target

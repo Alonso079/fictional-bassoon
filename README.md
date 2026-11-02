@@ -85,6 +85,14 @@ y reanudación controlada de protectores BitLocker.
 
 ## Uso del prototipo
 
+Para generar programas Linux/Windows, instalar el servidor como servicio y
+publicar instaladores versionados, consultar el
+[manual de versiones e instaladores](punishell-rust/docs/RELEASES.md).
+El workflow preparado **Build Linux and Windows packages** produce TAR/ZIP/EXE
+con SHA-256 una vez activado siguiendo el manual (requiere permiso `workflow`).
+Los paquetes Windows sin firma quedan identificados y requieren Authenticode
+antes de instalarlos.
+
 Sin DNS ni infraestructura previa, el agente admite una dirección manual como
 `https://192.168.1.50:8443`. El servidor debe escuchar en su interfaz LAN y su
 certificado HTTPS debe incluir la IP. La guía de

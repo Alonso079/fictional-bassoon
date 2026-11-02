@@ -8,6 +8,10 @@ Defender, WMI de persistencia, ejecución oculta ni reglas `Deny Delete`.
 
 ## Componentes
 
+La compilación, empaquetado, instalación systemd y publicación en GitHub Releases
+están detalladas en [el manual de versiones](docs/RELEASES.md). El alcance de
+distribución es servidor Linux x64 y agente Windows x64.
+
 | Crate | Función |
 |---|---|
 | `protocol` | Sobre Ed25519 con dominios independientes para dispositivo, servidor, licencia, comando y actualización. |

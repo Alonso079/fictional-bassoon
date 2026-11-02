@@ -1,0 +1,90 @@
+# Copy to .github/workflows/packages.yml using a credential with workflow scope.
+name: Build Linux and Windows packages
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy && rustup default 1.97.1
+      - name: Validate workspace
+        working-directory: punishell-rust
+        run: |
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Package Linux server
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        run: bash punishell-rust/tools/package_linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-server
+          path: dist/punishell-server-*
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default 1.97.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test Windows workspace
+        working-directory: punishell-rust
+        run: |
+          cargo test --workspace --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build Windows agent
+        working-directory: punishell-rust
+        run: |
+          cargo build --release -p punishell-agent --target x86_64-pc-windows-msvc --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package unsigned laboratory agent
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        run: .\punishell-rust\tools\package_windows.ps1 -Executable .\punishell-rust\target\x86_64-pc-windows-msvc\release\punishell-agent.exe -AllowUnsigned
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-agent-unsigned
+          path: dist/punishell-agent-*
+          if-no-files-found: error
+          retention-days: 14
+
+  draft-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+      - name: Create draft prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" packages/* --verify-tag --draft --prerelease \
+            --title "PuniShell $RELEASE_TAG — laboratorio" \
+            --notes 'Servidor Linux x64 y agente Windows x64. El agente unsigned requiere firma Authenticode y un nuevo empaquetado antes de instalar. Configurar IP, TLS, trust.json y activación según el manual incluido.'
