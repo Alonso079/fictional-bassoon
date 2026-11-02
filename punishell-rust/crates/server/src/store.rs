@@ -74,6 +74,19 @@ pub const COMMAND_KEY: &str = "command-v1";
 pub const LICENSE_KEY: &str = "license-v1";
 pub const SERVER_KEY: &str = "server-v1";
 pub const UPDATE_KEY: &str = "update-v1";
+pub const SCHEMA_VERSION: i64 = 6;
+
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
+pub struct MaintenanceReport {
+    pub at: i64,
+    pub expired_commands: u64,
+    pub sessions: u64,
+    pub challenges: u64,
+    pub activation_codes: u64,
+    pub password_resets: u64,
+    pub rate_limits: u64,
+    pub telemetry_samples: u64,
+}
 
 pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     let mut options = std::fs::OpenOptions::new();
@@ -224,7 +237,33 @@ impl App {
         let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
             .fetch_one(&pool)
             .await?;
-        if version != 4 {
+        if version == 4 {
+            let mut tx = pool.begin().await?;
+            sqlx::raw_sql(include_str!("../migrations/0005_incidents.sql"))
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("INSERT INTO schema_version VALUES (5)")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&pool)
+            .await?;
+        if version == 5 {
+            let mut tx = pool.begin().await?;
+            sqlx::raw_sql(include_str!("../migrations/0006_command_verification.sql"))
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("INSERT INTO schema_version VALUES (6)")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&pool)
+            .await?;
+        if version != SCHEMA_VERSION {
             return Err(Error::Invalid("versión DB incompatible"));
         }
         let license_trust = trust(&[public_config(LICENSE_KEY, &license_key)])?;
@@ -241,6 +280,57 @@ impl App {
             password_slots: tokio::sync::Semaphore::new(4),
             dummy_hash,
         }))
+    }
+
+    /// One transaction keeps command expiry and its audit event inseparable.
+    /// Receipts, identities and audit history are deliberately retained.
+    pub async fn maintain(&self, now: i64) -> Result<MaintenanceReport> {
+        let mut tx = self.pool.begin().await?;
+        let expired_commands = expire_commands(&mut tx, None, now).await?;
+        crate::incidents::evaluate(&mut tx, now).await?;
+        crate::verification::expire(&mut tx, now).await?;
+        let sessions = sqlx::query("DELETE FROM sessions WHERE expires_at<=?")
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        // Challenges reference activation codes: delete children first, and
+        // preserve an expired code if a still-valid challenge references it.
+        let challenges = sqlx::query("DELETE FROM challenges WHERE expires_at<=?")
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let activation_codes = sqlx::query("DELETE FROM activation_codes WHERE expires_at<=? AND NOT EXISTS (SELECT 1 FROM challenges WHERE code_hash=activation_codes.code_hash)")
+            .bind(now).execute(&mut *tx).await?.rows_affected();
+        let password_resets = sqlx::query("DELETE FROM password_resets WHERE expires_at<=?")
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        // Current rate-limit windows are at most five minutes; keep a full day
+        // so maintenance cannot reset an active throttling window.
+        let rate_limits = sqlx::query("DELETE FROM rate_limits WHERE window_start<?")
+            .bind(now - 24 * 3600)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let telemetry_samples = sqlx::query("DELETE FROM telemetry_samples WHERE captured_at<?")
+            .bind(now - 30 * 24 * 3600)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(MaintenanceReport {
+            at: now,
+            expired_commands,
+            sessions,
+            challenges,
+            activation_codes,
+            password_resets,
+            rate_limits,
+            telemetry_samples,
+        })
     }
 }
 
@@ -290,6 +380,31 @@ pub async fn audit(
     sqlx::query("INSERT INTO audit(tenant_id,actor,event,object_id,at,previous_hash,hash) VALUES(?,?,?,?,?,?,?)")
         .bind(tenant).bind(actor).bind(event).bind(object).bind(now).bind(previous).bind(hash).execute(&mut **tx).await?;
     Ok(())
+}
+
+pub async fn expire_commands(
+    tx: &mut Transaction<'_, Sqlite>,
+    agent: Option<&str>,
+    now: i64,
+) -> Result<u64> {
+    let expired = sqlx::query("SELECT id,tenant_id FROM commands WHERE expires_at<=? AND state IN ('pending','approved','claimed') AND (? IS NULL OR agent_id=?) ORDER BY id")
+        .bind(now).bind(agent).bind(agent).fetch_all(&mut **tx).await?;
+    for command in &expired {
+        sqlx::query("UPDATE commands SET state='expired' WHERE id=?")
+            .bind(command.get::<&str, _>("id"))
+            .execute(&mut **tx)
+            .await?;
+        audit(
+            tx,
+            command.get("tenant_id"),
+            "maintenance",
+            "command_expired",
+            command.get("id"),
+            now,
+        )
+        .await?;
+    }
+    Ok(expired.len() as u64)
 }
 pub async fn rate(app: &App, scope: &str, limit: i64, seconds: i64, now: i64) -> Result<()> {
     sqlx::query("INSERT INTO rate_limits VALUES(?,?,1) ON CONFLICT(scope) DO UPDATE SET attempts=CASE WHEN window_start<=? THEN 1 ELSE attempts+1 END, window_start=CASE WHEN window_start<=? THEN excluded.window_start ELSE window_start END")

@@ -863,3 +863,50 @@ pub async fn offline_inventory(agent: &Agent) -> Result<Inventory> {
     require_feature(&license, state, Feature::Inventory)?;
     Ok(platform::inventory())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_ip_configuration_preserves_https_and_trust_requirements() {
+        let root = tempfile::tempdir().unwrap();
+        let key = generate_signing_key();
+        let public = PublicKeyConfig {
+            key_id: "lab-root".into(),
+            public_key_b64: URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+            not_before: Utc::now() - chrono::Duration::days(1),
+            not_after: Utc::now() + chrono::Duration::days(1),
+        };
+        let mut config = Config {
+            server_url: "https://192.168.1.50:8443".into(),
+            tenant_id: "main".into(),
+            state_dir: root.path().join("state"),
+            installed_executable: root.path().join("agent.exe"),
+            server_keys: vec![public.clone()],
+            command_keys: vec![public.clone()],
+            license_keys: vec![public.clone()],
+            update_keys: vec![public],
+            ca_certificate: None,
+            managed_services: BTreeSet::new(),
+            update_channels: BTreeSet::new(),
+            signer_certificates: BTreeSet::new(),
+            poll_seconds: 30,
+        };
+        assert!(config.validate().is_ok());
+        config.server_url = "https://[fd00::50]:8443".into();
+        assert!(config.validate().is_ok());
+        for invalid in [
+            "http://192.168.1.50:8443",
+            "https://192.168.1.50:8443/",
+            "https://user:password@192.168.1.50:8443",
+            "https://192.168.1.50:8443/api",
+        ] {
+            config.server_url = invalid.into();
+            assert!(config.validate().is_err(), "accepted {invalid}");
+        }
+        config.server_url = "https://192.168.1.50:8443".into();
+        config.server_keys.clear();
+        assert!(config.validate().is_err());
+    }
+}

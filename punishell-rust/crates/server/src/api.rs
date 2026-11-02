@@ -91,6 +91,11 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/v1/enrollment/start", post(enrollment_start))
         .route("/api/v1/agent", post(device))
         .route("/api/v1/overview", get(overview))
+        .route("/api/v1/incidents", get(incidents))
+        .route(
+            "/api/v1/incidents/{id}/acknowledge",
+            post(acknowledge_incident),
+        )
         .route("/api/v1/agents", get(agents))
         .route("/api/v1/agents/{id}", get(agent_detail))
         .route("/api/v1/agents/{id}/telemetry", get(agent_telemetry))
@@ -130,16 +135,24 @@ async fn liveness() -> Json<Value> {
     Json(json!({"status":"ok","version":env!("CARGO_PKG_VERSION")}))
 }
 
-async fn readiness(State(app): State<Arc<App>>) -> Result<Json<Value>> {
-    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
-        .fetch_one(&app.pool)
-        .await?;
-    if version != 4 {
-        return Err(Error::Invalid("esquema no preparado"));
+async fn readiness(State(app): State<Arc<App>>) -> Response {
+    let check = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&app.pool),
+    )
+    .await;
+    match check {
+        Ok(Ok(version)) if version == store::SCHEMA_VERSION => Json(
+            json!({"status":"ready","version":env!("CARGO_PKG_VERSION"),"schema_version":version}),
+        )
+        .into_response(),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status":"not_ready"})),
+        )
+            .into_response(),
     }
-    Ok(Json(
-        json!({"status":"ready","version":env!("CARGO_PKG_VERSION"),"schema_version":version}),
-    ))
 }
 async fn session(app: &App, headers: &HeaderMap, write: bool) -> Result<Session> {
     if headers
@@ -1119,7 +1132,15 @@ async fn device(
                     .execute(&mut *tx)
                     .await?;
             }
-            sqlx::query("UPDATE commands SET state='expired' WHERE agent_id=? AND expires_at<=? AND state IN ('pending','approved','claimed')").bind(&request.agent_id).bind(now.timestamp()).execute(&mut *tx).await?;
+            crate::verification::observe(
+                &mut tx,
+                &request.agent_id,
+                inventory,
+                request.sequence as i64,
+                now.timestamp(),
+            )
+            .await?;
+            store::expire_commands(&mut tx, Some(&request.agent_id), now.timestamp()).await?;
             if state == punishell_licensing::LicenseState::Active {
                 if let Some(row)=sqlx::query("SELECT id,envelope,action FROM commands WHERE agent_id=? AND state='approved' AND expires_at>? ORDER BY created_at LIMIT 1").bind(&request.agent_id).bind(now.timestamp()).fetch_optional(&mut *tx).await? {
                     let action:Action=serde_json::from_str(row.get("action"))?;
@@ -1142,7 +1163,7 @@ async fn device(
                 return Err(Error::Invalid("resultado"));
             }
             let row = sqlx::query(
-                "SELECT state,output FROM commands WHERE id=? AND agent_id=? AND lease_token=?",
+                "SELECT state,output,action FROM commands WHERE id=? AND agent_id=? AND lease_token=?",
             )
             .bind(command_id)
             .bind(&request.agent_id)
@@ -1153,6 +1174,7 @@ async fn device(
             let current: String = row.get("state");
             let target = if *success { "succeeded" } else { "failed" };
             if current == "claimed" || current == "expired" {
+                let action: Action = serde_json::from_str(row.get("action"))?;
                 sqlx::query("UPDATE commands SET state=?,output=?,completed_at=? WHERE id=?")
                     .bind(target)
                     .bind(output)
@@ -1160,6 +1182,24 @@ async fn device(
                     .bind(command_id)
                     .execute(&mut *tx)
                     .await?;
+                if *success && matches!(action, Action::ResumeBitLockerProtection { .. }) {
+                    crate::verification::start(
+                        &mut tx,
+                        command_id,
+                        request.sequence as i64,
+                        now.timestamp(),
+                    )
+                    .await?;
+                    audit(
+                        &mut tx,
+                        &tenant,
+                        &request.agent_id,
+                        "command_verification_pending",
+                        command_id,
+                        now.timestamp(),
+                    )
+                    .await?;
+                }
                 audit(
                     &mut tx,
                     &tenant,
@@ -1272,6 +1312,69 @@ struct Page {
     offset: Option<u32>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncidentQuery {
+    state: Option<String>,
+    offset: Option<u32>,
+}
+
+async fn incidents(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Query(query): Query<IncidentQuery>,
+) -> Result<Json<Value>> {
+    let s = session(&app, &headers, false).await?;
+    let state = query.state.as_deref().unwrap_or("active");
+    if !matches!(
+        state,
+        "active" | "open" | "acknowledged" | "resolved" | "all"
+    ) {
+        return Err(Error::Invalid("estado de incidencia"));
+    }
+    let rows = sqlx::query("SELECT * FROM incidents WHERE tenant_id=? AND (?='all' OR state=? OR (?='active' AND state IN ('open','acknowledged'))) ORDER BY first_seen DESC,id DESC LIMIT 100 OFFSET ?")
+        .bind(&s.tenant_id).bind(state).bind(state).bind(state).bind(query.offset.unwrap_or(0))
+        .fetch_all(&app.pool).await?;
+    Ok(Json(json!(rows.iter().map(|r| json!({
+        "id":r.get::<String,_>("id"),"agent_id":r.get::<String,_>("agent_id"),
+        "kind":r.get::<String,_>("kind"),"severity":r.get::<String,_>("severity"),
+        "state":r.get::<String,_>("state"),"first_seen":r.get::<i64,_>("first_seen"),
+        "last_seen":r.get::<i64,_>("last_seen"),"evidence_at":r.get::<i64,_>("evidence_at"),
+        "detail":r.get::<String,_>("detail"),"acknowledged_by":r.get::<Option<String>,_>("acknowledged_by"),
+        "acknowledged_at":r.get::<Option<i64>,_>("acknowledged_at"),"resolved_at":r.get::<Option<i64>,_>("resolved_at")
+    })).collect::<Vec<_>>())))
+}
+
+async fn acknowledge_incident(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let s = session(&app, &headers, true).await?;
+    if !matches!(s.role, Role::Administrator | Role::Operator) {
+        return Err(Error::Forbidden);
+    }
+    let now = Utc::now().timestamp();
+    let mut tx = app.pool.begin().await?;
+    let changed = sqlx::query("UPDATE incidents SET state='acknowledged',acknowledged_by=?,acknowledged_at=? WHERE id=? AND tenant_id=? AND state='open'")
+        .bind(&s.user_id).bind(now).bind(&id).bind(&s.tenant_id)
+        .execute(&mut *tx).await?.rows_affected();
+    if changed != 1 {
+        return Err(Error::Conflict);
+    }
+    audit(
+        &mut tx,
+        &s.tenant_id,
+        &s.user_id,
+        "incident_acknowledged",
+        &id,
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({"id":id,"state":"acknowledged"})))
+}
+
 fn agent_status(last_seen: Option<i64>, revoked: bool, now: i64) -> &'static str {
     if revoked {
         "revoked"
@@ -1287,6 +1390,8 @@ fn agent_status(last_seen: Option<i64>, revoked: bool, now: i64) -> &'static str
 async fn overview(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<Json<Value>> {
     let s = session(&app, &headers, false).await?;
     let now = Utc::now().timestamp();
+    let incidents = sqlx::query("SELECT COUNT(*) active,COALESCE(SUM(CASE WHEN state='open' THEN 1 ELSE 0 END),0) open FROM incidents WHERE tenant_id=? AND state IN ('open','acknowledged')")
+        .bind(&s.tenant_id).fetch_one(&app.pool).await?;
     let agents = sqlx::query("SELECT COUNT(*) total,COALESCE(SUM(CASE WHEN revoked=0 AND last_seen>=? THEN 1 ELSE 0 END),0) online,COALESCE(SUM(CASE WHEN revoked=0 AND last_seen<? AND last_seen>=? THEN 1 ELSE 0 END),0) stale,COALESCE(SUM(CASE WHEN revoked=0 AND (last_seen IS NULL OR last_seen<?) THEN 1 ELSE 0 END),0) offline,COALESCE(SUM(CASE WHEN revoked=1 THEN 1 ELSE 0 END),0) revoked FROM agents WHERE tenant_id=?")
         .bind(now - 120)
         .bind(now - 120)
@@ -1356,6 +1461,7 @@ async fn overview(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<Jso
         "agents": {"total":agents.get::<i64,_>("total"),"online":agents.get::<i64,_>("online"),"stale":agents.get::<i64,_>("stale"),"offline":agents.get::<i64,_>("offline"),"revoked":agents.get::<i64,_>("revoked")},
         "commands": {"pending":commands.get::<i64,_>("pending"),"approved":commands.get::<i64,_>("approved"),"running":commands.get::<i64,_>("running"),"failed_24h":commands.get::<i64,_>("failed_24h")},
         "telemetry_samples_24h": samples,
+        "incidents": {"active":incidents.get::<i64,_>("active"),"open":incidents.get::<i64,_>("open")},
         "bitlocker": {"protected":bitlocker_protected,"unprotected":bitlocker_unprotected,"unknown":bitlocker_unknown},
         "license": license,
         "generated_at": now
@@ -1386,7 +1492,7 @@ async fn agent_detail(
     let row=sqlx::query("SELECT id,inventory,last_seen,version,revoked,sequence FROM agents WHERE id=? AND tenant_id=?").bind(&id).bind(&s.tenant_id).fetch_optional(&app.pool).await?.ok_or(Error::Conflict)?;
     let last_seen = row.get::<Option<i64>, _>("last_seen");
     let revoked = row.get::<bool, _>("revoked");
-    let commands=sqlx::query("SELECT id,action,state,created_at,expires_at,output,completed_at FROM commands WHERE agent_id=? AND tenant_id=? ORDER BY created_at DESC,rowid DESC LIMIT 20").bind(&id).bind(&s.tenant_id).fetch_all(&app.pool).await?;
+    let commands=sqlx::query("SELECT * FROM commands WHERE agent_id=? AND tenant_id=? ORDER BY created_at DESC,rowid DESC LIMIT 20").bind(&id).bind(&s.tenant_id).fetch_all(&app.pool).await?;
     Ok(Json(json!({
         "id":id,
         "status":agent_status(last_seen,revoked,Utc::now().timestamp()),
@@ -1395,7 +1501,7 @@ async fn agent_detail(
         "revoked":revoked,
         "sequence":row.get::<i64,_>("sequence"),
         "inventory":serde_json::from_str::<Value>(row.get("inventory")).unwrap_or(Value::Null),
-        "commands":commands.iter().map(|r|json!({"id":r.get::<String,_>("id"),"action":serde_json::from_str::<Value>(r.get("action")).unwrap_or(Value::Null),"state":r.get::<String,_>("state"),"created_at":r.get::<i64,_>("created_at"),"expires_at":r.get::<i64,_>("expires_at"),"output":r.get::<Option<String>,_>("output"),"completed_at":r.get::<Option<i64>,_>("completed_at")})).collect::<Vec<_>>()
+        "commands":commands.iter().map(|r|json!({"id":r.get::<String,_>("id"),"action":serde_json::from_str::<Value>(r.get("action")).unwrap_or(Value::Null),"state":r.get::<String,_>("state"),"created_at":r.get::<i64,_>("created_at"),"expires_at":r.get::<i64,_>("expires_at"),"output":r.get::<Option<String>,_>("output"),"completed_at":r.get::<Option<i64>,_>("completed_at"),"verification":verification_json(r)})).collect::<Vec<_>>()
     })))
 }
 
@@ -1629,14 +1735,24 @@ async fn end_action(
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
+fn verification_json(row: &sqlx::sqlite::SqliteRow) -> Value {
+    match row.get::<Option<String>, _>("verification_state") {
+        None => Value::Null,
+        Some(state) => json!({"state":state,
+            "deadline":row.get::<Option<i64>,_>("verification_deadline"),
+            "observed_at":row.get::<Option<i64>,_>("verification_at"),
+            "detail":row.get::<Option<String>,_>("verification_detail")}),
+    }
+}
+
 async fn commands(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     Query(page): Query<Page>,
 ) -> Result<Json<Value>> {
     let s = session(&app, &headers, false).await?;
-    let rows=sqlx::query("SELECT id,agent_id,requester,action,state,created_at,expires_at,output,completed_at FROM commands WHERE tenant_id=? ORDER BY created_at DESC,rowid DESC LIMIT 100 OFFSET ?").bind(s.tenant_id).bind(page.offset.unwrap_or(0)).fetch_all(&app.pool).await?;
-    Ok(Json(json!(rows.iter().map(|r|json!({"id":r.get::<String,_>("id"),"agent_id":r.get::<String,_>("agent_id"),"requester":r.get::<String,_>("requester"),"action":serde_json::from_str::<Value>(r.get("action")).unwrap_or(Value::Null),"state":r.get::<String,_>("state"),"created_at":r.get::<i64,_>("created_at"),"expires_at":r.get::<i64,_>("expires_at"),"output":r.get::<Option<String>,_>("output"),"completed_at":r.get::<Option<i64>,_>("completed_at")})).collect::<Vec<_>>())))
+    let rows=sqlx::query("SELECT * FROM commands WHERE tenant_id=? ORDER BY created_at DESC,rowid DESC LIMIT 100 OFFSET ?").bind(s.tenant_id).bind(page.offset.unwrap_or(0)).fetch_all(&app.pool).await?;
+    Ok(Json(json!(rows.iter().map(|r|json!({"id":r.get::<String,_>("id"),"agent_id":r.get::<String,_>("agent_id"),"requester":r.get::<String,_>("requester"),"action":serde_json::from_str::<Value>(r.get("action")).unwrap_or(Value::Null),"state":r.get::<String,_>("state"),"created_at":r.get::<i64,_>("created_at"),"expires_at":r.get::<i64,_>("expires_at"),"output":r.get::<Option<String>,_>("output"),"completed_at":r.get::<Option<i64>,_>("completed_at"),"verification":verification_json(r)})).collect::<Vec<_>>())))
 }
 async fn audit_log(
     State(app): State<Arc<App>>,

@@ -79,6 +79,10 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    Maintenance {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 fn password() -> Result<String> {
     if let Ok(value) = std::env::var("PUNISHELL_PASSWORD") {
@@ -93,6 +97,26 @@ fn password() -> Result<String> {
 }
 fn config(path: &PathBuf) -> Result<Config> {
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = terminate.recv() => {},
+                }
+            }
+            Err(error) => {
+                eprintln!("No se pudo registrar SIGTERM: {error}");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 #[tokio::main]
 async fn main() {
@@ -170,17 +194,52 @@ async fn run() -> Result<()> {
             )
             .await?;
             let app = App::open(config).await?;
+            // Fail before accepting traffic if the initial maintenance fails.
+            let report = app.maintain(Utc::now().timestamp()).await?;
+            eprintln!(
+                "{}",
+                serde_json::json!({"event":"maintenance","report":report})
+            );
+            let (stop, mut stopped) = tokio::sync::watch::channel(false);
+            let maintenance_app = app.clone();
+            let maintenance = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                interval.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = stopped.changed() => break,
+                        _ = interval.tick() => {
+                            match maintenance_app.maintain(Utc::now().timestamp()).await {
+                                Ok(report) => eprintln!("{}", serde_json::json!({"event":"maintenance","report":report})),
+                                Err(error) => eprintln!("{}", serde_json::json!({"event":"maintenance_failed","error":error.to_string()})),
+                            }
+                        }
+                    }
+                }
+            });
             let handle = axum_server::Handle::new();
             let shutdown = handle.clone();
-            tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
+            let signal = tokio::spawn(async move {
+                shutdown_signal().await;
                 shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
             });
             eprintln!("PuniShell HTTPS en {address}; no hay listener HTTP.");
-            axum_server::bind_rustls(address, tls)
+            let result = axum_server::bind_rustls(address, tls)
                 .handle(handle)
-                .serve(api::router(app).into_make_service())
-                .await?;
+                .serve(api::router(app.clone()).into_make_service())
+                .await;
+            let _ = stop.send(true);
+            let _ = maintenance.await;
+            signal.abort();
+            app.pool.close().await;
+            result?;
+        }
+        Command::Maintenance { config: path } => {
+            let app = App::open(config(&path)?).await?;
+            let report = app.maintain(Utc::now().timestamp()).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            app.pool.close().await;
         }
         Command::AddUser {
             config: path,

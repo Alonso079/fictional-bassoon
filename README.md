@@ -30,6 +30,14 @@ nativa con Windows.
 - Actualizaciones verificadas mediante manifiesto Ed25519, SHA-256 y firma
   Authenticode fijada por certificado.
 - Auditoría encadenada para detectar alteraciones en los eventos registrados.
+- Centro de incidencias persistentes de desconexión, disco bajo y BitLocker,
+  con reconocimiento, recuperación por evidencia nueva e historial auditado.
+- Verificación posterior de acciones BitLocker por volumen: separa el resultado
+  de ejecución de la confirmación de protección mediante un heartbeat nuevo.
+- Mantenimiento al arranque y cada minuto: vencimiento auditado de comandos,
+  limpieza de credenciales temporales vencidas y retención de telemetría.
+- Comprobaciones de disponibilidad con HTTP 503 ante fallos de SQLite y cierre
+  ordenado mediante `SIGTERM` o Ctrl+C.
 
 ## Arquitectura
 
@@ -76,6 +84,12 @@ estación, reinicio de servicios permitidos, actualización, rotación de identi
 y reanudación controlada de protectores BitLocker.
 
 ## Uso del prototipo
+
+Sin DNS ni infraestructura previa, el agente admite una dirección manual como
+`https://192.168.1.50:8443`. El servidor debe escuchar en su interfaz LAN y su
+certificado HTTPS debe incluir la IP. La guía de
+[laboratorio con IP manual](punishell-rust/README.md#laboratorio-sin-dns-dirección-ip-manual)
+detalla la CA de pruebas, red, instalación y requisitos del cliente.
 
 ### 1. Requisitos
 

@@ -106,7 +106,10 @@ async fn enrollment_signed_heartbeat_and_replay() {
     assert_eq!(response.status(), StatusCode::OK);
     let ready: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
-    assert_eq!(ready["schema_version"], 4);
+    assert_eq!(
+        ready["schema_version"],
+        punishell_server::store::SCHEMA_VERSION
+    );
     let code = security::token();
     sqlx::query("INSERT INTO activation_codes(code_hash,tenant_id,expires_at) VALUES(?,'main',?)")
         .bind(security::digest(code.as_bytes()))
@@ -338,6 +341,149 @@ async fn enrollment_signed_heartbeat_and_replay() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Maintenance must not prevent a legitimate late result from resolving
+    // an action already claimed before its execution window expired.
+    sqlx::query("INSERT INTO users(id,tenant_id,username,password_hash,role,totp_secret) VALUES('operator','main','operator','unused','operator','unused')")
+        .execute(&app.pool).await.unwrap();
+    sqlx::query("INSERT INTO commands(id,tenant_id,agent_id,requester,action,state,created_at,expires_at,lease_token) VALUES('late','main',?,'operator',?,'claimed',0,1,'valid-lease')")
+        .bind(&challenge.agent_id)
+        .bind(serde_json::to_string(&punishell_protocol::Action::ResumeBitLockerProtection { mount_point: "C:".into() }).unwrap())
+        .execute(&app.pool).await.unwrap();
+    assert_eq!(
+        app.maintain(Utc::now().timestamp())
+            .await
+            .unwrap()
+            .expired_commands,
+        1
+    );
+    for (lease, expected) in [
+        ("wrong-lease", StatusCode::FORBIDDEN),
+        ("valid-lease", StatusCode::OK),
+    ] {
+        let complete = DeviceRequest {
+            agent_id: challenge.agent_id.clone(),
+            request_id: security::id(),
+            sequence: 3,
+            issued_at: Utc::now(),
+            operation: AgentOperation::Complete {
+                command_id: "late".into(),
+                lease_token: lease.into(),
+                success: true,
+                output: "completed before disconnect".into(),
+            },
+        };
+        let signed = sign_payload(&complete, Purpose::Device, &challenge.agent_id, &key).unwrap();
+        let encrypted = encrypt_payload(
+            &signed,
+            EncryptionDirection::AgentToServer,
+            &challenge.agent_id,
+            &transport_id,
+            &transport_key,
+        )
+        .unwrap();
+        assert_eq!(post(&router, "/api/v1/agent", &encrypted).await.0, expected);
+    }
+    let state: String = sqlx::query_scalar("SELECT state FROM commands WHERE id='late'")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "succeeded");
+    let verification: String =
+        sqlx::query_scalar("SELECT verification_state FROM commands WHERE id='late'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(verification, "pending"); // Stored pre-execution C: inventory was on.
+    for (sequence, mount_point, expected) in [(4, "D:", "pending"), (5, "C:", "verified")] {
+        let request = DeviceRequest {
+            agent_id: challenge.agent_id.clone(),
+            request_id: security::id(),
+            sequence,
+            issued_at: Utc::now(),
+            operation: AgentOperation::Heartbeat {
+                inventory: Inventory {
+                    bitlocker_volumes: vec![test_volume(mount_point, "on")],
+                    ..Default::default()
+                },
+                version: "0.1.0".into(),
+            },
+        };
+        let signed = sign_payload(&request, Purpose::Device, &challenge.agent_id, &key).unwrap();
+        let encrypted = encrypt_payload(
+            &signed,
+            EncryptionDirection::AgentToServer,
+            &challenge.agent_id,
+            &transport_id,
+            &transport_key,
+        )
+        .unwrap();
+        let (status, _) = post(&router, "/api/v1/agent", &encrypted).await;
+        assert_eq!(status, StatusCode::OK);
+        let verification: String =
+            sqlx::query_scalar("SELECT verification_state FROM commands WHERE id='late'")
+                .fetch_one(&app.pool)
+                .await
+                .unwrap();
+        assert_eq!(verification, expected);
+        // A byte-identical replay must not duplicate verification audit events.
+        assert_eq!(
+            post(&router, "/api/v1/agent", &encrypted).await.0,
+            StatusCode::OK
+        );
+    }
+    let events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit WHERE event='command_verified'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(events, 1);
+    let token = security::token();
+    sqlx::query("INSERT INTO sessions VALUES(?,'operator','csrf',?,0)")
+        .bind(security::digest(token.as_bytes()))
+        .bind(Utc::now().timestamp() + 3600)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    for path in [
+        "/api/v1/commands".to_string(),
+        format!("/api/v1/agents/{}", challenge.agent_id),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("cookie", format!("punishell={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let data: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        let commands = data
+            .as_array()
+            .or_else(|| data["commands"].as_array())
+            .unwrap();
+        assert_eq!(
+            commands.iter().find(|c| c["id"] == "late").unwrap()["verification"]["state"],
+            "verified"
+        );
+    }
+}
+
+fn test_volume(mount_point: &str, status: &str) -> BitLockerVolume {
+    BitLockerVolume {
+        mount_point: Some(mount_point.into()),
+        protection_status: status.into(),
+        conversion_status: None,
+        encryption_percentage: Some(100),
+        encryption_method: None,
+        lock_status: None,
+        auto_unlock_enabled: None,
+        errors: vec![],
+    }
 }
 
 #[tokio::test]
@@ -424,4 +570,516 @@ async fn administrator_login_six_month_license_and_activation_code() {
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
     assert_eq!(body["activation_code"].as_str().unwrap().len(), 43);
+}
+
+#[tokio::test]
+async fn maintenance_expires_offline_commands_and_preserves_live_data() {
+    let (_dir, app, _router) = fixture().await;
+    let now = 2_000_000_000;
+    // Explicit timestamps exercise expiration boundaries without sleeping.
+    sqlx::raw_sql(
+        "INSERT INTO users(id,tenant_id,username,password_hash,role,totp_secret)
+         VALUES('operator','main','operator','unused','operator','unused');
+         INSERT INTO agents(id,tenant_id,public_key,sequence) VALUES('offline','main','unused',17);
+         INSERT INTO sessions VALUES('expired','operator','csrf',2000000000,0),('live','operator','csrf',2000000001,0);
+         INSERT INTO password_resets VALUES('expired','operator',2000000000,NULL),('live','operator',2000000001,NULL);
+         INSERT INTO activation_codes(code_hash,tenant_id,expires_at) VALUES
+         ('expired','main',2000000000),('referenced','main',2000000000),('live','main',2000000001);
+         INSERT INTO challenges VALUES
+         ('expired','main','offline','expired','unused','nonce',2000000000,NULL),
+         ('live','main','offline','referenced','unused','nonce',2000000001,NULL);
+         INSERT INTO rate_limits VALUES('old',1999913599,100),('boundary',1999913600,100),('live',2000000000,100);
+         INSERT INTO receipts VALUES('offline','receipt','hash','encrypted-response',0);
+         INSERT INTO commands(id,tenant_id,agent_id,requester,action,state,created_at,expires_at,lease_token) VALUES
+         ('pending','main','offline','operator','{}','pending',0,2000000000,NULL),
+         ('approved','main','offline','operator','{}','approved',0,2000000000,NULL),
+         ('claimed','main','offline','operator','{}','claimed',0,2000000000,'lease'),
+         ('live','main','offline','operator','{}','approved',0,2000000001,NULL),
+         ('done','main','offline','operator','{}','succeeded',0,2000000000,NULL);
+         INSERT INTO telemetry_samples(tenant_id,agent_id,captured_at,version,uptime_millis,adapter_count,wifi_count,interactive_user_count,error_count) VALUES
+         ('main','offline',1997407999,'0.1.0',0,0,0,0,0),
+         ('main','offline',1997408000,'0.1.0',0,0,0,0,0);",
+    ).execute(&app.pool).await.unwrap();
+    let report = app.maintain(now).await.unwrap();
+    assert_eq!(report.expired_commands, 3);
+    assert_eq!(report.sessions, 1);
+    assert_eq!(report.challenges, 1);
+    assert_eq!(report.activation_codes, 1);
+    assert_eq!(report.password_resets, 1);
+    assert_eq!(report.rate_limits, 1);
+    assert_eq!(report.telemetry_samples, 1);
+    let states: Vec<(String, String)> = sqlx::query_as("SELECT id,state FROM commands ORDER BY id")
+        .fetch_all(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        states,
+        vec![
+            ("approved".into(), "expired".into()),
+            ("claimed".into(), "expired".into()),
+            ("done".into(), "succeeded".into()),
+            ("live".into(), "approved".into()),
+            ("pending".into(), "expired".into()),
+        ]
+    );
+    let events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit WHERE event='command_expired'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(events, 3);
+    let retained: (i64, i64, String) = sqlx::query_as(
+        "SELECT sequence,(SELECT COUNT(*) FROM receipts),lease_token FROM agents JOIN commands ON commands.agent_id=agents.id WHERE commands.id='claimed'",
+    ).fetch_one(&app.pool).await.unwrap();
+    assert_eq!(retained, (17, 1, "lease".into()));
+    assert_eq!(
+        app.maintain(now).await.unwrap(),
+        punishell_server::store::MaintenanceReport {
+            at: now,
+            ..Default::default()
+        }
+    );
+    // A late receipt for a claimed action can still resolve an expired command;
+    // expiry does not invent a successful or failed OS result.
+    let unfinished: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM commands WHERE state='expired' AND completed_at IS NOT NULL",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(unfinished, 0);
+}
+
+#[tokio::test]
+async fn maintenance_rolls_back_expiry_when_audit_fails() {
+    let (_dir, app, _router) = fixture().await;
+    sqlx::raw_sql(
+        "INSERT INTO users(id,tenant_id,username,password_hash,role,totp_secret)
+         VALUES('operator','main','operator','unused','operator','unused');
+         INSERT INTO agents(id,tenant_id,public_key) VALUES('offline','main','unused');
+         INSERT INTO commands(id,tenant_id,agent_id,requester,action,state,created_at,expires_at)
+         VALUES('pending','main','offline','operator','{}','pending',0,1);
+         CREATE TRIGGER reject_audit BEFORE INSERT ON audit BEGIN SELECT RAISE(ABORT,'test failure'); END;",
+    ).execute(&app.pool).await.unwrap();
+    assert!(app.maintain(2).await.is_err());
+    let state: String = sqlx::query_scalar("SELECT state FROM commands WHERE id='pending'")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending");
+}
+
+#[tokio::test]
+async fn readiness_returns_unavailable_for_invalid_schema_and_database_failure() {
+    let (_dir, app, router) = fixture().await;
+    sqlx::query("INSERT INTO schema_version VALUES(99)")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(body, serde_json::json!({"status":"not_ready"}));
+    app.pool.close().await;
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/health/live")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn readiness_has_a_bounded_wait_when_database_is_busy() {
+    let (_dir, app, router) = fixture().await;
+    let _connection = app.pool.acquire().await.unwrap();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        router.oneshot(
+            Request::builder()
+                .uri("/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("readiness must not hang")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+async fn incident_inventory(app: &App, seen: i64, inventory: &Inventory) {
+    sqlx::query("UPDATE agents SET last_seen=?,inventory=? WHERE id='monitored'")
+        .bind(seen)
+        .bind(serde_json::to_string(inventory).unwrap())
+        .execute(&app.pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn incidents_deduplicate_require_fresh_recovery_and_reopen() {
+    let (_dir, app, _router) = fixture().await;
+    let now = Utc::now().timestamp();
+    sqlx::query("INSERT INTO agents(id,tenant_id,public_key) VALUES('monitored','main','unused')")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let mut inventory = Inventory {
+        disk_free_bytes: Some(5),
+        disk_total_bytes: Some(100),
+        bitlocker_volumes: vec![BitLockerVolume {
+            mount_point: Some("C:".into()),
+            protection_status: "off".into(),
+            conversion_status: None,
+            encryption_percentage: Some(100),
+            encryption_method: None,
+            lock_status: None,
+            auto_unlock_enabled: None,
+            errors: vec![],
+        }],
+        ..Default::default()
+    };
+    incident_inventory(&app, now, &inventory).await;
+    app.maintain(now).await.unwrap();
+    app.maintain(now + 1).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM incidents")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+    // Preserve recognition while the same finding remains active.
+    sqlx::query("UPDATE incidents SET state='acknowledged' WHERE kind='disk_low'")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    app.maintain(now + 2).await.unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM incidents WHERE kind='disk_low'")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "acknowledged");
+    inventory.disk_free_bytes = Some(90);
+    inventory.bitlocker_volumes[0].protection_status = "on".into();
+    // Even a healthy-looking old inventory cannot close either finding.
+    incident_inventory(&app, now, &inventory).await;
+    app.maintain(now + 3).await.unwrap();
+    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM incidents WHERE state!='resolved'")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(active, 2); // Same evidence timestamp cannot establish recovery.
+    app.maintain(now + 901).await.unwrap();
+    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM incidents WHERE state!='resolved'")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(active, 3); // Includes the newly detected offline incident.
+                           // Unknown BitLocker data after reconnect is not proof of protection.
+    inventory.bitlocker_volumes[0].protection_status = "unknown".into();
+    incident_inventory(&app, now + 902, &inventory).await;
+    app.maintain(now + 902).await.unwrap();
+    let active: Vec<String> =
+        sqlx::query_scalar("SELECT kind FROM incidents WHERE state!='resolved'")
+            .fetch_all(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(active, vec!["bitlocker_unprotected"]);
+    inventory.bitlocker_volumes[0].protection_status = "on".into();
+    incident_inventory(&app, now + 903, &inventory).await;
+    app.maintain(now + 903).await.unwrap();
+    inventory.bitlocker_volumes[0].protection_status = "off".into();
+    incident_inventory(&app, now + 904, &inventory).await;
+    app.maintain(now + 904).await.unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM incidents WHERE kind='bitlocker_unprotected'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 2); // New episode; the previous history is retained.
+    sqlx::query("UPDATE agents SET revoked=1 WHERE id='monitored'")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    app.maintain(now + 905).await.unwrap();
+    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM incidents WHERE state!='resolved'")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(active, 0);
+    let closed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit WHERE event='incident_closed_revoked'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(closed, 1);
+}
+
+#[tokio::test]
+async fn incident_api_enforces_tenant_roles_csrf_and_audits_acknowledgement() {
+    let (_dir, app, router) = fixture().await;
+    let now = Utc::now().timestamp();
+    sqlx::raw_sql(
+        "INSERT INTO tenants VALUES('other','Other',0);
+        INSERT INTO agents(id,tenant_id,public_key) VALUES('monitored','main','unused');
+        INSERT INTO users(id,tenant_id,username,password_hash,role,totp_secret) VALUES
+        ('operator','main','operator','unused','operator','unused'),
+        ('auditor','main','auditor','unused','auditor','unused'),
+        ('foreign','other','foreign','unused','operator','unused');",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    incident_inventory(&app, now - 901, &Inventory::default()).await;
+    app.maintain(now).await.unwrap();
+    let id: String = sqlx::query_scalar("SELECT id FROM incidents")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    let mut tokens = vec![];
+    for user in ["operator", "auditor", "foreign"] {
+        let token = security::token();
+        sqlx::query("INSERT INTO sessions VALUES(?,?,'csrf',?,?)")
+            .bind(security::digest(token.as_bytes()))
+            .bind(user)
+            .bind(now + 3600)
+            .bind(now)
+            .execute(&app.pool)
+            .await
+            .unwrap();
+        tokens.push(token);
+    }
+    for (token, csrf, expected) in [
+        ("invalid", "csrf", StatusCode::UNAUTHORIZED),
+        (tokens[0].as_str(), "wrong", StatusCode::FORBIDDEN),
+        (tokens[1].as_str(), "csrf", StatusCode::FORBIDDEN),
+        (tokens[2].as_str(), "csrf", StatusCode::CONFLICT),
+        (tokens[0].as_str(), "csrf", StatusCode::OK),
+        (tokens[0].as_str(), "csrf", StatusCode::CONFLICT),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/incidents/{id}/acknowledge"))
+            .header("cookie", format!("punishell={token}"))
+            .header("x-csrf-token", csrf)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(request).await.unwrap().status(),
+            expected
+        );
+    }
+    for (token, expected) in [(&tokens[0], 1), (&tokens[2], 0)] {
+        let request = Request::builder()
+            .uri("/api/v1/incidents")
+            .header("cookie", format!("punishell={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let records: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(records.as_array().unwrap().len(), expected);
+    }
+    let audit: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit WHERE event='incident_acknowledged'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(audit, 1);
+}
+
+#[tokio::test]
+async fn existing_v4_database_migrates_without_losing_agents() {
+    let (_dir, app, _router) = fixture().await;
+    sqlx::raw_sql("INSERT INTO agents(id,tenant_id,public_key,sequence) VALUES('existing','main','unused',42);
+        DROP TABLE incidents;
+        DROP INDEX commands_verification;
+        ALTER TABLE commands DROP COLUMN verification_state;
+        ALTER TABLE commands DROP COLUMN verification_sequence;
+        ALTER TABLE commands DROP COLUMN verification_deadline;
+        ALTER TABLE commands DROP COLUMN verification_at;
+        ALTER TABLE commands DROP COLUMN verification_detail;
+        ALTER TABLE commands DROP COLUMN verification_last_status;
+        DELETE FROM schema_version WHERE version>=5;")
+        .execute(&app.pool).await.unwrap();
+    let config = app.config.clone();
+    app.pool.close().await;
+    let upgraded = App::open(config.clone()).await.unwrap();
+    let sequence: i64 = sqlx::query_scalar("SELECT sequence FROM agents WHERE id='existing'")
+        .fetch_one(&upgraded.pool)
+        .await
+        .unwrap();
+    assert_eq!(sequence, 42);
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(&upgraded.pool)
+        .await
+        .unwrap();
+    assert_eq!(version, punishell_server::store::SCHEMA_VERSION);
+    upgraded.maintain(Utc::now().timestamp()).await.unwrap();
+    upgraded.pool.close().await;
+    // Reopening must not reapply the migration.
+    App::open(config).await.unwrap().pool.close().await;
+}
+
+#[tokio::test]
+async fn incident_opening_rolls_back_when_audit_is_unavailable() {
+    let (_dir, app, _router) = fixture().await;
+    let now = Utc::now().timestamp();
+    sqlx::query("INSERT INTO agents(id,tenant_id,public_key,last_seen) VALUES('monitored','main','unused',?)")
+        .bind(now - 901).execute(&app.pool).await.unwrap();
+    sqlx::raw_sql("CREATE TRIGGER reject_incident_audit BEFORE INSERT ON audit BEGIN SELECT RAISE(ABORT,'test failure'); END;")
+        .execute(&app.pool).await.unwrap();
+    assert!(app.maintain(now).await.is_err());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM incidents")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn bitlocker_verification_rejects_ambiguous_evidence_and_closes_on_deadline() {
+    use punishell_server::verification;
+    let (_dir, app, _router) = fixture().await;
+    let now = Utc::now().timestamp();
+    sqlx::raw_sql("INSERT INTO agents(id,tenant_id,public_key) VALUES('device','main','unused'),('other','main','unused');
+        INSERT INTO users(id,tenant_id,username,password_hash,role,totp_secret) VALUES('operator','main','operator','unused','operator','unused');")
+        .execute(&app.pool).await.unwrap();
+    for id in ["off", "unknown", "revoked"] {
+        sqlx::query("INSERT INTO commands(id,tenant_id,agent_id,requester,action,state,created_at,expires_at) VALUES(?,'main',?,'operator',?,'succeeded',0,1)")
+            .bind(id).bind(if id=="revoked" {"other"}else{"device"})
+            .bind(serde_json::to_string(&punishell_protocol::Action::ResumeBitLockerProtection {mount_point:"C:".into()}).unwrap())
+            .execute(&app.pool).await.unwrap();
+        let mut tx = app.pool.begin().await.unwrap();
+        verification::start(&mut tx, id, 10, now).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    let on = test_volume("C:", "on");
+    let mut error = on.clone();
+    error.errors.push("WMI incompleto".into());
+    for volumes in [
+        vec![],
+        vec![error],
+        vec![on.clone(), on.clone()],
+        vec![test_volume("D:", "on")],
+    ] {
+        let mut tx = app.pool.begin().await.unwrap();
+        verification::observe(
+            &mut tx,
+            "device",
+            &Inventory {
+                bitlocker_volumes: volumes,
+                ..Default::default()
+            },
+            11,
+            now + 1,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    // A healthy reading with a pre-completion sequence cannot verify anything.
+    let mut tx = app.pool.begin().await.unwrap();
+    verification::observe(
+        &mut tx,
+        "device",
+        &Inventory {
+            bitlocker_volumes: vec![on.clone()],
+            ..Default::default()
+        },
+        10,
+        now + 2,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let states: Vec<String> = sqlx::query_scalar("SELECT verification_state FROM commands")
+        .fetch_all(&app.pool)
+        .await
+        .unwrap();
+    assert!(states.iter().all(|s| s == "pending"));
+    // Off evidence is retained until the verification window ends.
+    let mut tx = app.pool.begin().await.unwrap();
+    verification::observe(
+        &mut tx,
+        "device",
+        &Inventory {
+            bitlocker_volumes: vec![test_volume("C:", "off")],
+            ..Default::default()
+        },
+        12,
+        now + 3,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    sqlx::query("UPDATE commands SET verification_last_status='unknown' WHERE id='unknown'")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agents SET revoked=1 WHERE id='other'")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let mut tx = app.pool.begin().await.unwrap();
+    verification::expire(&mut tx, now + 900).await.unwrap();
+    verification::observe(
+        &mut tx,
+        "device",
+        &Inventory {
+            bitlocker_volumes: vec![on],
+            ..Default::default()
+        },
+        13,
+        now + 901,
+    )
+    .await
+    .unwrap();
+    verification::expire(&mut tx, now + 901).await.unwrap();
+    tx.commit().await.unwrap();
+    let states: Vec<(String, String)> =
+        sqlx::query_as("SELECT id,verification_state FROM commands ORDER BY id")
+            .fetch_all(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        states,
+        vec![
+            ("off".into(), "not_verified".into()),
+            ("revoked".into(), "inconclusive".into()),
+            ("unknown".into(), "inconclusive".into())
+        ]
+    );
+    let events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit WHERE event='command_verification_closed'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(events, 3);
 }
