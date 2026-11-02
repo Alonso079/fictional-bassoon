@@ -34,6 +34,8 @@ nativa con Windows.
   con reconocimiento, recuperación por evidencia nueva e historial auditado.
 - Verificación posterior de acciones BitLocker por volumen: separa el resultado
   de ejecución de la confirmación de protección mediante un heartbeat nuevo.
+- Logs rotativos del cliente, correlación de peticiones y exportación local de
+  diagnóstico con metadatos acotados, sin copiar configuración ni claves.
 - Mantenimiento al arranque y cada minuto: vencimiento auditado de comandos,
   limpieza de credenciales temporales vencidas y retención de telemetría.
 - Comprobaciones de disponibilidad con HTTP 503 ante fallos de SQLite y cierre

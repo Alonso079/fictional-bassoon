@@ -44,13 +44,30 @@ impl IntoResponse for Error {
         if status.is_server_error() {
             eprintln!("Error interno: {self}");
         }
-        (
+        let category = match &self {
+            Self::Unauthorized => "authentication",
+            Self::Forbidden => "authorization",
+            Self::Conflict => "conflict",
+            Self::RateLimited => "rate_limit",
+            Self::Invalid(_) => "validation",
+            Self::Database(_) => "database",
+            Self::Json(_) => "json",
+            Self::Io(_) => "io",
+            Self::Protocol(_) => "protocol",
+            Self::License(_) => "license",
+            Self::Domain(_) => "policy",
+        };
+        let mut response = (
             status,
             Json(json!({"error":status.canonical_reason().unwrap_or("error")})),
         )
-            .into_response()
+            .into_response();
+        response.extensions_mut().insert(FailureCategory(category));
+        response
     }
 }
+#[derive(Clone)]
+struct FailureCategory(&'static str);
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route(
@@ -114,8 +131,19 @@ pub fn router(app: Arc<App>) -> Router {
 async fn headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let request_id = security::id();
     let method = req.method().clone();
-    let path = req.uri().path().to_owned();
+    let path = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|route| route.as_str())
+        .unwrap_or("unmatched")
+        .to_owned();
     let started = std::time::Instant::now();
+    let client_request_id = req
+        .headers()
+        .get("x-punishell-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| valid_id(v))
+        .map(str::to_owned);
     let mut response = next.run(req).await;
     for (key,value) in [("content-security-policy","default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"),
         ("strict-transport-security","max-age=31536000"),("x-content-type-options","nosniff"),("referrer-policy","no-referrer"),("cache-control","no-store")] {
@@ -126,7 +154,7 @@ async fn headers(req: axum::extract::Request, next: axum::middleware::Next) -> R
     }
     eprintln!(
         "{}",
-        json!({"event":"http_request","request_id":request_id,"method":method.as_str(),"path":path,"status":response.status().as_u16(),"duration_ms":started.elapsed().as_millis()})
+        json!({"at":Utc::now().to_rfc3339(),"level":if response.status().is_server_error(){"error"}else if response.status().is_client_error(){"warn"}else{"info"},"event":"http_request","version":env!("CARGO_PKG_VERSION"),"request_id":request_id,"client_request_id":client_request_id,"failure":response.extensions().get::<FailureCategory>().map(|c|c.0),"method":method.as_str(),"path":path,"status":response.status().as_u16(),"duration_ms":started.elapsed().as_millis()})
     );
     response
 }

@@ -22,6 +22,12 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    ExportDiagnostics {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     Enroll {
         #[arg(long)]
         config: PathBuf,
@@ -56,6 +62,10 @@ async fn main() {
 }
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
+        Command::ExportDiagnostics { state_dir, output } => {
+            punishell_agent::logging::export(&state_dir, &output)?;
+            println!("Diagnóstico exportado: {}", output.display());
+        }
         Command::Enroll { config } => {
             use std::io::Write;
             eprint!("Código de activación (entrada estándar): ");
@@ -102,7 +112,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("la instalación del servicio requiere Windows".into());
             }
         }
-        Command::ApplyUpdate { config } => update::apply(&config)?,
+        Command::ApplyUpdate { config } => {
+            let result = update::apply(&config);
+            if let Err(error) = &result {
+                if let Ok(config) = runtime::read_config(&config) {
+                    punishell_agent::logging::emit(
+                        &config.state_dir,
+                        punishell_agent::logging::Record::new(
+                            punishell_agent::logging::Event::UpdateFailed,
+                        )
+                        .error(error),
+                    );
+                }
+            }
+            result?;
+        }
         Command::LockDesktop => punishell_windows_platform::lock_desktop()?,
     }
     Ok(())

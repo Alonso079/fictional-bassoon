@@ -400,7 +400,80 @@ cifrar y el servidor rechaza cualquier downgrade posterior. Un agente antiguo no
 anuncia esa capacidad, por lo que puede seguir comunicándose mientras se completa
 el despliegue escalonado.
 
-## Validación y pendientes de despliegue
+## Logs y diagnóstico de pruebas
+
+El agente registra eventos JSONL en `%ProgramData%\PuniShell\logs\agent.jsonl`.
+El archivo rota al alcanzar 1 MiB y conserva cuatro archivos anteriores
+(`agent.1.jsonl` a `agent.4.jsonl`). Un lock entre procesos coordina el servicio,
+la consola y el helper de actualización. En Windows se heredan las ACL del
+directorio de estado, restringidas por el instalador a SYSTEM y Administrators;
+en Unix se usan directorios 0700 y archivos nuevos 0600.
+
+Se registran inicio/parada, enrolamiento, peticiones, duración, errores de
+conexión, reintentos y próxima espera, ejecución/rechazo de acciones, preparación
+de actualización y confirmación o intento de rollback. Cada registro contiene
+fecha UTC, nivel, versión y, cuando corresponde, identificadores de agente,
+petición y comando. Las peticiones incluyen host/IP y puerto del servidor,
+sin usuario, contraseña, ruta ni query string.
+
+Las categorías distinguen timeout, DNS, TLS, conexión, HTTP, SQLite, plataforma,
+protocolo, licencia, política y configuración. DNS/TLS se clasifican según las
+causas disponibles en la biblioteca HTTP: algunos errores pueden quedar en una
+categoría más general. Los cuerpos de mensajes, códigos de activación, claves,
+cookies, tokens y texto arbitrario de excepciones no se escriben en estos logs.
+Los errores detallados WMI siguen disponibles en el inventario autorizado.
+
+Un fallo al escribir el log se avisa por stderr sin provocar reejecución de una
+acción. Los errores fatales del servicio también se registran en este directorio
+cuando se puede escribir en ProgramData; ya no se sobrescribe un único
+`service-error.log`. El instalador escribe `installer.jsonl`, con un archivo
+anterior de hasta 1 MiB, desde que valida el ejecutable y prepara las ACL. Los
+fallos previos a esa fase se muestran en consola. No usa una transcripción de
+PowerShell que pudiera guardar el código de activación.
+
+Para observar el cliente desde PowerShell elevado:
+
+```powershell
+Get-Content "$env:ProgramData\PuniShell\logs\agent.jsonl" -Tail 40 -Wait
+Get-Content "$env:ProgramData\PuniShell\logs\installer.jsonl" -Tail 40
+```
+
+Exportar un diagnóstico local, incluso si la configuración o la identidad del
+agente no se pueden abrir:
+
+```powershell
+& "$env:ProgramFiles\PuniShell\punishell-agent.exe" export-diagnostics `
+  --state-dir "$env:ProgramData\PuniShell" `
+  --output "$env:TEMP\punishell-diagnostic.json"
+```
+
+La exportación conserva los últimos 200 eventos válidos del agente e instalador,
+ordenados por fecha, y cuenta las entradas descartadas. Lee únicamente los
+nombres de log conocidos, con límites de tamaño, valida el esquema y excluye
+entradas con campos desconocidos. No copia `agent.json`, identidades, SQLite,
+inventario ni claves. Rechaza sobrescribir el destino. El archivo sí contiene
+identificadores y direcciones del servidor: revisarlo antes de compartirlo.
+La exportación es local y no se envía automáticamente a terceros.
+
+En el servidor, los logs HTTP incluyen fecha UTC, nivel, versión, duración,
+categoría de fallo, `request_id` propio y `client_request_id` para correlacionar
+con el cliente. Se registra el patrón de ruta, no queries ni rutas desconocidas
+arbitrarias. Este último identificador procede de un encabezado validado sintácticamente y
+sirve sólo como pista de diagnóstico, no como identidad autenticada. La auditoría
+de seguridad continúa siendo un registro separado en SQLite.
+
+```bash
+sudo journalctl -u punishell-server -f
+sudo journalctl -u punishell-server --since "30 minutes ago" --no-pager
+```
+
+La retención del journal depende de la configuración del host; no se crea un
+segundo archivo rotativo para el servidor. Para probar, usar una IP inaccesible,
+una CA incorrecta, un código de activación vencido y una acción no permitida en
+el laboratorio, y comprobar categorías, reintentos y auditoría. Estas funciones
+requieren recompilar los binarios; no modifican paquetes ya generados.
+
+## Validaciones automatizadas
 
 ```bash
 cargo fmt --all -- --check

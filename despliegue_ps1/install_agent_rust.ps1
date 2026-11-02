@@ -8,6 +8,22 @@ param(
     [string]$CaCertificate
 )
 $ErrorActionPreference = 'Stop'
+$script:InstallLogPath = $null
+$script:InstallVersion = '0.0.0'
+function Write-InstallEvent([string]$Event, [string]$Level = 'info') {
+    if (-not $script:InstallLogPath) { return }
+    try {
+        if ((Test-Path -LiteralPath $script:InstallLogPath) -and (Get-Item -LiteralPath $script:InstallLogPath).Length -gt (1MB - 2048)) {
+            Move-Item -LiteralPath $script:InstallLogPath -Destination ($script:InstallLogPath -replace 'installer.jsonl$','installer.1.jsonl') -Force
+        }
+        $record = [ordered]@{ at = [DateTime]::UtcNow.ToString('o'); level = $Level; event = $Event; version = $script:InstallVersion }
+        [IO.File]::AppendAllText($script:InstallLogPath, (($record | ConvertTo-Json -Compress) + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false)))
+    } catch { [Console]::Error.WriteLine('No se pudo escribir el log del instalador.') }
+}
+trap {
+    Write-InstallEvent 'install_failed' 'error'
+    throw
+}
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Ejecutar como administrador.'
 }
@@ -32,8 +48,16 @@ foreach ($dir in @($install,$state)) {
     & icacls.exe $dir '/inheritance:r' '/grant:r' 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "No se pudo proteger ACL: $dir" }
 }
+$logDirectory = Join-Path $state 'logs'
+New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+$script:InstallLogPath = Join-Path $logDirectory 'installer.jsonl'
+$reportedVersion = & $source --version
+if ($LASTEXITCODE -ne 0 -or $reportedVersion -notmatch '^punishell-agent\s+([0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?)$') { throw 'Versión de agente inválida.' }
+$script:InstallVersion = $Matches[1]
+Write-InstallEvent 'install_started'
 $target = Join-Path $install 'punishell-agent.exe'
 Copy-Item -LiteralPath $source -Destination $target -ErrorAction Stop
+Write-InstallEvent 'install_files_copied'
 $ca = $null
 if ($CaCertificate) {
     $ca = Join-Path $install 'server-ca.pem'
@@ -59,8 +83,11 @@ $configPath = Join-Path $install 'agent.json'
 & icacls.exe $configPath '/inheritance:r' '/grant:r' 'SYSTEM:F' 'Administrators:F' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'No se pudo proteger agent.json.' }
 $code = Read-Host 'Código de activación de un solo uso'
+Write-InstallEvent 'install_enrollment_started'
 $code | & $target enroll --config $configPath
 if ($LASTEXITCODE -ne 0) { throw 'La activación falló; no se creó el servicio.' }
+Write-InstallEvent 'install_service_started'
 & $target install-service --config $configPath
 if ($LASTEXITCODE -ne 0) { throw 'El servicio no se pudo instalar.' }
+Write-InstallEvent 'install_completed'
 Write-Host "PuniShellAgent instalado y activado. Configuración: $configPath"

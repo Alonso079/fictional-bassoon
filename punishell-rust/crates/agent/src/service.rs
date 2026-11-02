@@ -57,11 +57,17 @@ pub fn install(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 fn service_main(_args: Vec<OsString>) {
     if let Err(error) = worker() {
-        let path = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.join("service-error.log")));
-        if let Some(path) = path {
-            let _ = std::fs::write(path, error.to_string());
+        if let Some(base) = std::env::var_os("ProgramData") {
+            let state = std::path::PathBuf::from(base).join("PuniShell");
+            let record = if let Some(error) = error.downcast_ref::<runtime::Error>() {
+                crate::logging::Record::new(crate::logging::Event::ServiceFailed).error(error)
+            } else {
+                let mut record = crate::logging::Record::new(crate::logging::Event::ServiceFailed);
+                record.level = "error".into();
+                record.failure = Some(crate::logging::Failure::Platform);
+                record
+            };
+            crate::logging::emit(&state, record);
         }
     }
 }

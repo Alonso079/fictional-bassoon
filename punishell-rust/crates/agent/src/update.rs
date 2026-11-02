@@ -1,4 +1,5 @@
 //! Actualización con manifiesto Ed25519, SHA-256 y Authenticode fijado.
+use crate::logging::{self, Event, Record};
 use crate::runtime::{self, Agent, Error, Result};
 #[cfg(windows)]
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -129,6 +130,7 @@ pub async fn stage(agent: &Agent, channel: &str, config_path: &Path) -> Result<(
         &agent.config.state_dir.join("update.json"),
         &serde_json::to_vec(&state)?,
     )?;
+    logging::emit(&agent.config.state_dir, Record::new(Event::UpdateStaged));
     #[cfg(windows)]
     {
         let helper = agent
@@ -163,6 +165,7 @@ pub fn apply(config_path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         let config = runtime::read_config(config_path)?;
+        logging::emit(&config.state_dir, Record::new(Event::UpdateApplying));
         let bytes = std::fs::read(config.state_dir.join("update.json"))?;
         let staged: Staged = serde_json::from_slice(&bytes)?;
         let channel = staged.manifest_channel()?;
@@ -213,6 +216,7 @@ pub fn apply(config_path: &Path) -> Result<()> {
                         if value["version"] == manifest.version
                             && value["at"].as_i64().is_some_and(|t| t >= start_at)
                         {
+                            logging::emit(&config.state_dir, Record::new(Event::UpdateConfirmed));
                             return Ok(());
                         }
                     }
@@ -220,6 +224,9 @@ pub fn apply(config_path: &Path) -> Result<()> {
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
+        let mut record = Record::new(Event::UpdateRollback);
+        record.level = "warn".into();
+        logging::emit(&config.state_dir, record);
         let _ = platform::stop_agent_service();
         let restore = config.state_dir.join("update-restore.exe");
         std::fs::copy(backup, &restore)?;

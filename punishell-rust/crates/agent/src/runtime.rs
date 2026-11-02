@@ -1,3 +1,4 @@
+use crate::logging::{self, Event, Record};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -353,12 +354,38 @@ impl Agent {
         Ok(envelope)
     }
     pub async fn rpc(&mut self, operation: AgentOperation) -> Result<ServerMessage> {
+        let started = std::time::Instant::now();
+        let mut request_id = None;
+        let result = self.rpc_inner(operation, &mut request_id).await;
+        let mut record = match &result {
+            Ok(_) => Record::new(Event::RpcSucceeded),
+            Err(error) => Record::new(Event::RpcFailed).error(error),
+        };
+        record.agent_id = Some(self.identity.agent_id.clone());
+        record.request_id = request_id;
+        record.duration_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        logging::emit(
+            &self.config.state_dir,
+            record.endpoint(&self.config.server_url),
+        );
+        result
+    }
+    async fn rpc_inner(
+        &mut self,
+        operation: AgentOperation,
+        request_id: &mut Option<String>,
+    ) -> Result<ServerMessage> {
         let envelope = self.prepare(operation).await?;
         let request: DeviceRequest = serde_json::from_slice(
             &URL_SAFE_NO_PAD
                 .decode(&envelope.payload_b64)
                 .map_err(|_| Error::Invalid("petición"))?,
         )?;
+        *request_id = Some(request.request_id.clone());
+        let mut record = Record::new(Event::RpcStarted);
+        record.agent_id = Some(self.identity.agent_id.clone());
+        record.request_id = Some(request.request_id.clone());
+        logging::emit(&self.config.state_dir, record);
         // La rotación conserva el mismo sobre hasta recibir el recibo servidor:
         // perderlo después del cambio de clave dejaría al dispositivo huérfano.
         if Utc::now() - request.issued_at > chrono::Duration::minutes(2)
@@ -389,6 +416,7 @@ impl Agent {
             self.client
                 .post(format!("{}/api/v1/agent", self.config.server_url))
                 .header("x-punishell-transport", "aes256gcm-v1")
+                .header("x-punishell-request-id", &request.request_id)
                 .json(&wire)
                 .send()
                 .await?,
@@ -547,6 +575,14 @@ impl Agent {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        let mut record = Record::new(Event::ActionFinished);
+        record.success = Some(success);
+        record.agent_id = Some(self.identity.agent_id.clone());
+        record.command_id = Some(id.into());
+        if !success {
+            record.level = "error".into();
+        }
+        logging::emit(&self.config.state_dir, record);
         Ok(())
     }
     async fn outbox(&self) -> Result<Option<AgentOperation>> {
@@ -610,6 +646,12 @@ impl Agent {
         ) {
             Ok(c) => c,
             Err(e) => {
+                let mut record = Record::new(Event::ActionRejected);
+                record.agent_id = Some(self.identity.agent_id.clone());
+                record.command_id = Some(id.clone());
+                record.failure = Some(logging::Failure::Policy);
+                record.level = "warn".into();
+                logging::emit(&self.config.state_dir, record);
                 self.finish_local(&id, false, &e.to_string()).await?;
                 return Ok(());
             }
@@ -618,6 +660,10 @@ impl Agent {
             .bind(&id)
             .execute(&self.pool)
             .await?;
+        let mut record = Record::new(Event::ActionStarted);
+        record.agent_id = Some(self.identity.agent_id.clone());
+        record.command_id = Some(id.clone());
+        logging::emit(&self.config.state_dir, record);
         let result: Result<String> = match claims.action {
             Action::CollectInventory => Ok(serde_json::to_string(&platform::inventory())?),
             Action::DiagnosticBundle { max_bytes, .. } => {
@@ -675,7 +721,13 @@ impl Agent {
         };
         match result {
             Ok(output) => self.finish_local(&id, true, &output).await?,
-            Err(error) => self.finish_local(&id, false, &error.to_string()).await?,
+            Err(error) => {
+                let mut record = Record::new(Event::ActionFailed).error(&error);
+                record.agent_id = Some(self.identity.agent_id.clone());
+                record.command_id = Some(id.clone());
+                logging::emit(&self.config.state_dir, record);
+                self.finish_local(&id, false, &error.to_string()).await?;
+            }
         }
         Ok(())
     }
@@ -686,6 +738,9 @@ impl Agent {
         once: bool,
     ) -> Result<()> {
         let _instance = instance_lock(&self.config)?;
+        let mut record = Record::new(Event::Started);
+        record.agent_id = Some(self.identity.agent_id.clone());
+        logging::emit(&self.config.state_dir, record);
         // No se repite una acción cuyo efecto no pudo confirmarse tras un reinicio.
         sqlx::query("UPDATE actions SET state='complete',success=0,output='Resultado incierto tras reinicio; no se volvió a ejecutar' WHERE state='running'").execute(&self.pool).await?;
         let mut failures = 0u32;
@@ -702,6 +757,9 @@ impl Agent {
                 Ok(_) => {
                     failures = 0;
                     if let Err(error) = self.execute(&config_path).await {
+                        let mut record = Record::new(Event::ActionFailed).error(&error);
+                        record.agent_id = Some(self.identity.agent_id.clone());
+                        logging::emit(&self.config.state_dir, record);
                         if once {
                             return Err(error);
                         }
@@ -725,6 +783,14 @@ impl Agent {
                 .saturating_mul(1u64 << failures.min(5))
                 .min(300);
             let jitter = (token().as_bytes()[0] as u64) % 3;
+            if failures > 0 {
+                let mut record = Record::new(Event::RetryScheduled);
+                record.level = "warn".into();
+                record.agent_id = Some(self.identity.agent_id.clone());
+                record.failures = Some(failures);
+                record.retry_seconds = Some(delay + jitter);
+                logging::emit(&self.config.state_dir, record);
+            }
             for _ in 0..(delay + jitter) * 2 {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -732,11 +798,34 @@ impl Agent {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
+        let mut record = Record::new(Event::Stopped);
+        record.agent_id = Some(self.identity.agent_id.clone());
+        logging::emit(&self.config.state_dir, record);
         Ok(())
     }
 }
 
 pub async fn enroll(config: Config, code: String) -> Result<String> {
+    config.validate()?;
+    logging::emit(
+        &config.state_dir,
+        Record::new(Event::EnrollmentStarted).endpoint(&config.server_url),
+    );
+    let state = config.state_dir.clone();
+    let result = enroll_inner(config, code).await;
+    let record = match &result {
+        Ok(agent_id) => {
+            let mut record = Record::new(Event::EnrollmentFinished);
+            record.agent_id = Some(agent_id.clone());
+            record
+        }
+        Err(error) => Record::new(Event::EnrollmentFinished).error(error),
+    };
+    logging::emit(&state, record);
+    result
+}
+
+async fn enroll_inner(config: Config, code: String) -> Result<String> {
     config.validate()?;
     std::fs::create_dir_all(&config.state_dir)?;
     #[cfg(unix)]
