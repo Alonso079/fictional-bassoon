@@ -24,8 +24,7 @@ fn with_policy(f: impl FnOnce(&CommandPolicy<'_>)) {
     let features = BTreeSet::from([
         Feature::Inventory,
         Feature::LockWorkstation,
-        Feature::Diagnostics,
-        Feature::ManageServices,
+        Feature::WipeData,
         Feature::Updates,
         Feature::ManageBitLocker,
     ]);
@@ -42,12 +41,14 @@ fn with_policy(f: impl FnOnce(&CommandPolicy<'_>)) {
 }
 
 #[test]
-fn request_permission_requires_operator_in_the_same_tenant() {
+fn request_permission_requires_requester_in_the_same_tenant() {
     for role in [
-        Role::Administrator,
-        Role::Operator,
+        Role::PlatformAdministrator,
+        Role::Requester,
         Role::Approver,
         Role::Auditor,
+        Role::TechnicalOperator,
+        Role::SecurityObserver,
     ] {
         let actor = Actor {
             user_id: "operator-1",
@@ -57,7 +58,7 @@ fn request_permission_requires_operator_in_the_same_tenant() {
         };
         assert_eq!(
             authorize_request(&actor, "tenant-1").is_ok(),
-            role == Role::Operator
+            role == Role::Requester
         );
         assert!(authorize_request(&actor, "tenant-2").is_err());
     }
@@ -117,7 +118,7 @@ fn approval_requires_a_different_user_fresh_mfa_and_pending_state() {
         now()
     )
     .is_err());
-    actor.role = Role::Operator;
+    actor.role = Role::Requester;
     actor.mfa_verified_at = Some(now());
     assert!(authorize_approval(
         &actor,
@@ -204,6 +205,25 @@ fn administrative_actions_require_approval_and_licensed_features() {
         ));
         c.approval_id = Some("approval-1".into());
         assert!(validate_command(&c, policy).is_ok());
+        c.action = Action::WipeData {
+            authorized_path: LAB_WIPE_PATH.into(),
+        };
+        c.approval_id = None;
+        assert!(matches!(
+            validate_command(&c, policy),
+            Err(DomainError::ApprovalRequired)
+        ));
+        c.approval_id = Some("approval-1".into());
+        assert!(validate_command(&c, policy).is_ok());
+        let no_wipe = BTreeSet::from([Feature::Inventory]);
+        let restricted = CommandPolicy {
+            enabled_features: &no_wipe,
+            ..*policy
+        };
+        assert!(matches!(
+            validate_command(&c, &restricted),
+            Err(DomainError::Forbidden)
+        ));
         c.action = Action::RotateAgentKey;
         assert!(matches!(
             validate_command(&c, policy),
@@ -213,30 +233,28 @@ fn administrative_actions_require_approval_and_licensed_features() {
 }
 
 #[test]
-fn parameters_cannot_expand_service_scope_or_resource_limits() {
+fn parameters_cannot_expand_lab_path_update_channel_or_volume() {
     with_policy(|policy| {
         let mut c = command();
         c.approval_id = Some("approval-1".into());
-        c.action = Action::RestartManagedService {
-            service_name: "PuniShellAgent".into(),
+        c.action = Action::WipeData {
+            authorized_path: LAB_WIPE_PATH.into(),
         };
         assert!(validate_command(&c, policy).is_ok());
-        c.action = Action::RestartManagedService {
-            service_name: "WinDefend".into(),
-        };
-        assert!(validate_command(&c, policy).is_err());
+        for invalid in [
+            r"C:\Windows",
+            r"C:\PuniShell_Lab_Data\..",
+            r"C:\PuniShell_Lab_Data\",
+            r"c:\PuniShell_Lab_Data",
+            r"\\server\share",
+        ] {
+            c.action = Action::WipeData {
+                authorized_path: invalid.into(),
+            };
+            assert!(validate_command(&c, policy).is_err(), "accepted {invalid}");
+        }
         c.action = Action::RequestUpdate {
             channel: "untrusted".into(),
-        };
-        assert!(validate_command(&c, policy).is_err());
-        c.action = Action::DiagnosticBundle {
-            max_bytes: 1_048_577,
-            timeout_seconds: 60,
-        };
-        assert!(validate_command(&c, policy).is_err());
-        c.action = Action::DiagnosticBundle {
-            max_bytes: 512,
-            timeout_seconds: 61,
         };
         assert!(validate_command(&c, policy).is_err());
         c.action = Action::ResumeBitLockerProtection {

@@ -6,7 +6,12 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-chrono.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+base64.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
 punishell-protocol.workspace = true
 thiserror.workspace = true
 

@@ -4,8 +4,8 @@ use punishell_protocol::{generate_signing_key, sign_payload, wire::UpdateManifes
 use punishell_server::{
     api, security,
     store::{
-        self, public_config, write_private, App, Config, Error, Result, COMMAND_KEY, LICENSE_KEY,
-        SERVER_KEY, UPDATE_KEY,
+        self, public_config, write_private, App, Config, Error, Result, COMMAND_KEY, SERVER_KEY,
+        UPDATE_KEY,
     },
 };
 use sqlx::Row;
@@ -30,6 +30,9 @@ enum Command {
         certificate: PathBuf,
         #[arg(long)]
         private_key: PathBuf,
+        /// Clave pública del proveedor; nunca su license.key.
+        #[arg(long)]
+        license_public_key: PathBuf,
         #[arg(long, default_value = "admin")]
         username: String,
         #[arg(long, default_value = "main")]
@@ -135,6 +138,7 @@ async fn run() -> Result<()> {
             private_key,
             username,
             tenant,
+            license_public_key,
         } => {
             if !punishell_protocol::valid_id(&tenant) {
                 return Err(Error::Invalid("tenant"));
@@ -142,6 +146,9 @@ async fn run() -> Result<()> {
             if state_dir.exists() || config_path.exists() {
                 return Err(Error::Conflict);
             }
+            let license_root: punishell_protocol::wire::PublicKeyConfig =
+                serde_json::from_slice(&std::fs::read(license_public_key)?)?;
+            store::trust(std::slice::from_ref(&license_root))?;
             let pass = password()?;
             security::password_hash(&pass)?;
             std::fs::create_dir_all(&state_dir)?;
@@ -150,7 +157,7 @@ async fn run() -> Result<()> {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
             }
-            for name in ["command", "license", "server", "update", "encryption"] {
+            for name in ["command", "server", "update", "encryption"] {
                 write_private(
                     &state_dir.join(format!("{name}.key")),
                     &generate_signing_key().to_bytes(),
@@ -165,6 +172,11 @@ async fn run() -> Result<()> {
                 managed_services: BTreeSet::new(),
                 update_channels: BTreeSet::from(["stable".into()]),
             };
+            let roots = serde_json::json!({"license":license_root});
+            write_private(
+                &config.state_dir.join("trust.json"),
+                &serde_json::to_vec_pretty(&roots)?,
+            )?;
             let app = App::open(config.clone()).await?;
             sqlx::query("INSERT INTO tenants VALUES(?,?,?)")
                 .bind(&tenant)
@@ -172,12 +184,14 @@ async fn run() -> Result<()> {
                 .bind(Utc::now().timestamp())
                 .execute(&app.pool)
                 .await?;
-            let user = api::add_user(&app, &tenant, &username, &pass, "administrator").await?;
+            let user =
+                api::add_user(&app, &tenant, &username, &pass, "platform_administrator").await?;
             write_private(&config_path, &serde_json::to_vec_pretty(&config)?)?;
-            let roots = serde_json::json!({"server":public_config(SERVER_KEY,&app.server_key),"command":public_config(COMMAND_KEY,&app.command_key),"license":public_config(LICENSE_KEY,&app.license_key),"update":public_config(UPDATE_KEY,&app.update_key)});
-            write_private(
-                &app.config.state_dir.join("trust.json"),
-                &serde_json::to_vec_pretty(&roots)?,
+            let roots = serde_json::json!({"server":public_config(SERVER_KEY,&app.server_key),"command":public_config(COMMAND_KEY,&app.command_key),"license":license_root,"update":public_config(UPDATE_KEY,&app.update_key)});
+            // trust.json contains only public material; replace initial license root.
+            std::fs::write(
+                app.config.state_dir.join("trust.json"),
+                serde_json::to_vec_pretty(&roots)?,
             )?;
             println!("{}", serde_json::to_string_pretty(&user)?);
             eprintln!(

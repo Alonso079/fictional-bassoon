@@ -10,12 +10,17 @@ use punishell_protocol::{
 };
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
-    Administrator,
-    Operator,
+    SecurityObserver,
+    Requester,
     Approver,
+    TechnicalOperator,
     Auditor,
+    PlatformAdministrator,
 }
 
 pub struct Actor<'a> {
@@ -70,7 +75,7 @@ pub struct CommandPolicy<'a> {
 
 /// Equivalente de solicitar_accion.php, con aislamiento explícito de tenant.
 pub fn authorize_request(actor: &Actor<'_>, tenant_id: &str) -> Result<(), DomainError> {
-    if actor.role != Role::Operator
+    if actor.role != Role::Requester
         || actor.tenant_id != tenant_id
         || !valid_id(actor.user_id)
         || !valid_id(tenant_id)
@@ -171,18 +176,8 @@ pub fn validate_command(
 
 fn validate_action(action: &Action, policy: &CommandPolicy<'_>) -> Result<(), DomainError> {
     match action {
-        Action::DiagnosticBundle {
-            max_bytes,
-            timeout_seconds,
-        } if *max_bytes == 0
-            || *max_bytes > 1_048_576
-            || *timeout_seconds == 0
-            || *timeout_seconds > 60 =>
-        {
-            Err(DomainError::InvalidAction)
-        }
-        Action::RestartManagedService { service_name }
-            if !policy.managed_services.contains(service_name) || !valid_id(service_name) =>
+        Action::WipeData { authorized_path }
+            if authorized_path != punishell_protocol::LAB_WIPE_PATH =>
         {
             Err(DomainError::InvalidAction)
         }

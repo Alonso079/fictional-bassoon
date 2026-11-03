@@ -62,10 +62,14 @@ pub struct Config {
     pub license_keys: Vec<PublicKeyConfig>,
     pub update_keys: Vec<PublicKeyConfig>,
     pub ca_certificate: Option<PathBuf>,
+    /// Legacy configuration input; remote service management is no longer supported.
+    #[serde(default)]
     pub managed_services: BTreeSet<String>,
     pub update_channels: BTreeSet<String>,
     pub signer_certificates: BTreeSet<String>,
     pub poll_seconds: u64,
+    #[serde(default = "default_dead_man_seconds")]
+    pub dead_man_seconds: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,6 +81,35 @@ pub struct Identity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_key_b64: Option<String>,
 }
+fn default_dead_man_seconds() -> u64 {
+    72 * 60 * 60
+}
+
+// Keep wall time across restarts and monotonic elapsed time during this process.
+struct OfflineWatchdog {
+    last_contact: i64,
+    observed_at: std::time::Instant,
+    elapsed_at_start: u64,
+    last_lock: Option<std::time::Instant>,
+}
+impl OfflineWatchdog {
+    fn new(last_contact: i64, now: i64) -> Self {
+        Self {
+            last_contact,
+            observed_at: std::time::Instant::now(),
+            elapsed_at_start: now.saturating_sub(last_contact).max(0) as u64,
+            last_lock: None,
+        }
+    }
+    fn overdue(&self, now: i64, limit: u64) -> bool {
+        now < self.last_contact
+            || now.saturating_sub(self.last_contact) >= limit as i64
+            || self
+                .elapsed_at_start
+                .saturating_add(self.observed_at.elapsed().as_secs())
+                >= limit
+    }
+}
 pub struct Agent {
     pub config: Config,
     pub client: reqwest::Client,
@@ -87,6 +120,7 @@ pub struct Agent {
     pub command_trust: TrustStore,
     pub license_trust: TrustStore,
     pub update_trust: TrustStore,
+    watchdog: OfflineWatchdog,
 }
 pub fn token() -> String {
     use rand_core::RngCore;
@@ -116,6 +150,7 @@ impl Config {
             || !self.state_dir.is_absolute()
             || !self.installed_executable.is_absolute()
             || !(10..=3600).contains(&self.poll_seconds)
+            || !(60..=72 * 3600).contains(&self.dead_man_seconds)
         {
             return Err(Error::Invalid("HTTPS/tenant/ruta/polling"));
         }
@@ -274,6 +309,40 @@ impl Agent {
         let license_trust = trust(&config.license_keys)?;
         let update_trust = trust(&config.update_keys)?;
         let client = config.client()?;
+        let now = Utc::now().timestamp();
+        // Only authenticated RPCs update this persisted timestamp. An upgrade uses
+        // the last verified server message rather than granting a fresh grace period.
+        let contact =
+            sqlx::query_scalar::<_, String>("SELECT value FROM meta WHERE name='last_contact'")
+                .fetch_optional(&pool)
+                .await?;
+        let last_contact = if let Some(value) = contact {
+            value
+                .parse::<i64>()
+                .map_err(|_| Error::Invalid("last_contact"))?
+        } else {
+            let previous = sqlx::query_scalar::<_, String>(
+                "SELECT value FROM meta WHERE name='server_message'",
+            )
+            .fetch_optional(&pool)
+            .await?;
+            let baseline = if let Some(raw) = previous {
+                let message: ServerMessage = verify_payload(
+                    &serde_json::from_str(&raw)?,
+                    Purpose::Server,
+                    &server_trust,
+                    Utc::now(),
+                )?;
+                message.issued_at.timestamp()
+            } else {
+                now
+            };
+            sqlx::query("INSERT INTO meta VALUES('last_contact',?)")
+                .bind(baseline.to_string())
+                .execute(&pool)
+                .await?;
+            baseline
+        };
         Ok(Self {
             config,
             client,
@@ -284,6 +353,7 @@ impl Agent {
             command_trust,
             license_trust,
             update_trust,
+            watchdog: OfflineWatchdog::new(last_contact, now),
         })
     }
     pub async fn prepare(&self, mut operation: AgentOperation) -> Result<SignedEnvelope> {
@@ -539,10 +609,13 @@ impl Agent {
         }
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO meta VALUES('server_message',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value").bind(serde_json::to_string(&reply)?).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO meta VALUES('last_contact',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value")
+            .bind(now.timestamp().to_string()).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM pending WHERE id=1")
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        self.watchdog = OfflineWatchdog::new(now.timestamp(), now.timestamp());
         platform::atomic_private_write(
             &self.config.state_dir.join("health.json"),
             &serde_json::to_vec(
@@ -666,21 +739,12 @@ impl Agent {
         logging::emit(&self.config.state_dir, record);
         let result: Result<String> = match claims.action {
             Action::CollectInventory => Ok(serde_json::to_string(&platform::inventory())?),
-            Action::DiagnosticBundle { max_bytes, .. } => {
-                let mut value = serde_json::to_string_pretty(&platform::inventory())?;
-                while value.len() > max_bytes as usize {
-                    value.pop();
-                }
-                Ok(value)
-            }
+            Action::WipeData { authorized_path } => platform::wipe_lab_data(&authorized_path)
+                .map(|count| format!("WIPE laboratorio: {count} archivos de prueba eliminados"))
+                .map_err(Error::from),
             Action::LockWorkstation => platform::lock_interactive()
                 .map(|_| "Sesión interactiva bloqueada".into())
                 .map_err(Error::from),
-            Action::RestartManagedService { service_name } => {
-                platform::restart_service(&service_name)
-                    .map(|_| "Servicio reiniciado".into())
-                    .map_err(Error::from)
-            }
             Action::RequestUpdate { channel } => crate::update::stage(self, &channel, config_path)
                 .await
                 .map(|_| {
@@ -731,6 +795,36 @@ impl Agent {
         }
         Ok(())
     }
+    async fn enforce_dead_man(&mut self) -> Result<()> {
+        self.enforce_dead_man_with(Utc::now().timestamp(), platform::lock_interactive)
+            .await
+    }
+    async fn enforce_dead_man_with(
+        &mut self,
+        now: i64,
+        lock: impl FnOnce() -> platform::Result<()>,
+    ) -> Result<()> {
+        if !self.watchdog.overdue(now, self.config.dead_man_seconds)
+            || self
+                .watchdog
+                .last_lock
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+        {
+            return Ok(());
+        }
+        self.watchdog.last_lock = Some(std::time::Instant::now());
+        let result = lock();
+        let success = result.is_ok();
+        let mut record = match result {
+            Ok(()) => Record::new(Event::DeadManLock),
+            Err(error) => Record::new(Event::DeadManLock).error(&Error::Platform(error)),
+        };
+        record.agent_id = Some(self.identity.agent_id.clone());
+        record.success = Some(success);
+        logging::emit(&self.config.state_dir, record);
+        // Failure is logged and retried; it must not stop polling or the service.
+        Ok(())
+    }
     pub async fn run(
         mut self,
         config_path: PathBuf,
@@ -745,6 +839,7 @@ impl Agent {
         sqlx::query("UPDATE actions SET state='complete',success=0,output='Resultado incierto tras reinicio; no se volvió a ejecutar' WHERE state='running'").execute(&self.pool).await?;
         let mut failures = 0u32;
         while !stop.load(Ordering::Relaxed) {
+            self.enforce_dead_man().await?;
             let operation = if let Some(outbox) = self.outbox().await? {
                 outbox
             } else {
@@ -795,6 +890,7 @@ impl Agent {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
+                self.enforce_dead_man().await?;
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
@@ -957,6 +1053,131 @@ pub async fn offline_inventory(agent: &Agent) -> Result<Inventory> {
 mod tests {
     use super::*;
 
+    fn test_config(root: &Path) -> Config {
+        let key = generate_signing_key();
+        let public = PublicKeyConfig {
+            key_id: "test".into(),
+            public_key_b64: URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+            not_before: Utc::now() - chrono::Duration::days(1),
+            not_after: Utc::now() + chrono::Duration::days(365),
+        };
+        Config {
+            server_url: "https://localhost:8443".into(),
+            tenant_id: "main".into(),
+            state_dir: root.into(),
+            installed_executable: root.join("agent.exe"),
+            server_keys: vec![public.clone()],
+            command_keys: vec![public.clone()],
+            license_keys: vec![public.clone()],
+            update_keys: vec![public],
+            ca_certificate: None,
+            managed_services: BTreeSet::new(),
+            update_channels: BTreeSet::new(),
+            signer_certificates: BTreeSet::new(),
+            poll_seconds: 30,
+            dead_man_seconds: 120,
+        }
+    }
+
+    #[test]
+    fn dead_man_deadline_uses_wall_and_monotonic_time_and_detects_rollback() {
+        let mut watchdog = OfflineWatchdog::new(1000, 1000);
+        assert!(!watchdog.overdue(1119, 120));
+        assert!(watchdog.overdue(1120, 120));
+        assert!(watchdog.overdue(999, 120));
+        watchdog.observed_at = std::time::Instant::now() - Duration::from_secs(120);
+        assert!(watchdog.overdue(1001, 120)); // wall clock stalled or adjusted
+        let restarted = OfflineWatchdog::new(1000, 1121);
+        assert!(restarted.overdue(1121, 120));
+    }
+
+    #[tokio::test]
+    async fn dead_man_survives_restart_logs_result_and_retries_failed_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let config = test_config(root.path());
+        save_identity(
+            &config,
+            &Identity {
+                agent_id: "test-agent".into(),
+                private_key_b64: URL_SAFE_NO_PAD.encode(generate_signing_key().to_bytes()),
+                transport_key_id: None,
+                transport_key_b64: None,
+            },
+        )
+        .unwrap();
+        let agent = Agent::open(config.clone()).await.unwrap();
+        let last = Utc::now().timestamp() - 121;
+        sqlx::query("UPDATE meta SET value=? WHERE name='last_contact'")
+            .bind(last.to_string())
+            .execute(&agent.pool)
+            .await
+            .unwrap();
+        agent.pool.close().await;
+        let mut restarted = Agent::open(config.clone()).await.unwrap();
+        assert_eq!(restarted.watchdog.last_contact, last);
+        let locks = std::cell::Cell::new(0);
+        restarted
+            .enforce_dead_man_with(last + 120, || {
+                locks.set(locks.get() + 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(locks.get(), 1);
+        restarted
+            .enforce_dead_man_with(last + 121, || {
+                locks.set(locks.get() + 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(locks.get(), 1); // bounded repeat interval while still offline
+        restarted.watchdog.last_lock = Some(std::time::Instant::now() - Duration::from_secs(61));
+        restarted
+            .enforce_dead_man_with(last + 181, || {
+                Err(platform::PlatformError::Other("failure".into()))
+            })
+            .await
+            .unwrap();
+        restarted.watchdog.last_lock = Some(std::time::Instant::now() - Duration::from_secs(61));
+        restarted
+            .enforce_dead_man_with(last + 242, || {
+                locks.set(locks.get() + 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(locks.get(), 2);
+        let log = std::fs::read_to_string(root.path().join("logs/agent.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["event"], "dead_man_lock");
+        assert_eq!(events[0]["success"], true);
+        assert_eq!(events[1]["success"], false);
+        // Preparing a retry cannot move the last authenticated contact forward.
+        restarted
+            .prepare(AgentOperation::Heartbeat {
+                inventory: Inventory::default(),
+                version: "0.1.1".into(),
+            })
+            .await
+            .unwrap();
+        let persisted: String =
+            sqlx::query_scalar("SELECT value FROM meta WHERE name='last_contact'")
+                .fetch_one(&restarted.pool)
+                .await
+                .unwrap();
+        assert_eq!(persisted, last.to_string());
+        restarted.pool.close().await;
+        let mut legacy = serde_json::to_value(&config).unwrap();
+        legacy.as_object_mut().unwrap().remove("dead_man_seconds");
+        let restored: Config = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.dead_man_seconds, 72 * 3600);
+    }
+
     #[test]
     fn manual_ip_configuration_preserves_https_and_trust_requirements() {
         let root = tempfile::tempdir().unwrap();
@@ -981,6 +1202,7 @@ mod tests {
             update_channels: BTreeSet::new(),
             signer_certificates: BTreeSet::new(),
             poll_seconds: 30,
+            dead_man_seconds: default_dead_man_seconds(),
         };
         assert!(config.validate().is_ok());
         config.server_url = "https://[fd00::50]:8443".into();

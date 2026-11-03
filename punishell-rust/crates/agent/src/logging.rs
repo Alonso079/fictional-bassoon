@@ -29,6 +29,7 @@ pub enum Event {
     ActionFinished,
     ActionFailed,
     ActionRejected,
+    DeadManLock,
     UpdateStaged,
     UpdateApplying,
     UpdateConfirmed,

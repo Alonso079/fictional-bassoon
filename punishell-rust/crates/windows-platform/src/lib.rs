@@ -58,10 +58,6 @@ pub fn lock_desktop() -> Result<()> {
     Err(PlatformError::WindowsRequired)
 }
 #[cfg(not(windows))]
-pub fn restart_service(_name: &str) -> Result<()> {
-    Err(PlatformError::WindowsRequired)
-}
-#[cfg(not(windows))]
 pub fn resume_bitlocker_protection(_mount_point: &str) -> Result<()> {
     Err(PlatformError::WindowsRequired)
 }
@@ -96,4 +92,9 @@ pub fn atomic_private_write(path: &Path, data: &[u8]) -> Result<()> {
         std::fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn wipe_lab_data(_authorized_path: &str) -> Result<u64> {
+    Err(PlatformError::WindowsRequired)
 }

@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory=$true)][string]$ServerUrl,
     [Parameter(Mandatory=$true)][string]$Tenant,
     [Parameter(Mandatory=$true)][string]$SignerCertificateSha256,
-    [string]$CaCertificate
+    [string]$CaCertificate,
+    [ValidateRange(60,259200)][int]$DeadManSeconds = 259200
 )
 $ErrorActionPreference = 'Stop'
 $script:InstallLogPath = $null
@@ -77,6 +78,7 @@ $config = [ordered]@{
     update_channels = @('stable')
     signer_certificates = @($SignerCertificateSha256.ToLowerInvariant())
     poll_seconds = 30
+    dead_man_seconds = $DeadManSeconds
 }
 $configPath = Join-Path $install 'agent.json'
 [System.IO.File]::WriteAllText($configPath, ($config | ConvertTo-Json -Depth 12), (New-Object System.Text.UTF8Encoding($false)))

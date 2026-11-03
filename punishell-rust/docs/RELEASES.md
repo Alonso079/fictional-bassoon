@@ -137,17 +137,20 @@ ni habilita el servicio hasta que exista una configuración válida. Una instala
 posterior conserva estado y claves y exige detener primero el servicio.
 
 Preparar certificados TLS con la IP real en SAN, siguiendo el README técnico.
-Copiar sólo certificado y clave del servidor, con estos permisos:
+Copiar el certificado y la clave TLS del servidor, junto a la clave pública
+del proveedor, con estos permisos:
 
 ```bash
 sudo install -o root -g punishell -m 0640 /ruta/server.pem /etc/punishell/server.pem
 sudo install -o root -g punishell -m 0640 /ruta/server.key /etc/punishell/server.key
+sudo install -o root -g punishell -m 0640 /ruta/license-public.json /etc/punishell/license-public.json
 sudo -u punishell /usr/local/bin/punishell-server init \
   --config /var/lib/punishell/server.json \
   --state-dir /var/lib/punishell/state \
   --public-url https://192.168.1.50:8443 \
   --certificate /etc/punishell/server.pem \
-  --private-key /etc/punishell/server.key
+  --private-key /etc/punishell/server.key \
+  --license-public-key /etc/punishell/license-public.json
 ```
 
 Guardar la contraseña y el secreto TOTP inicial. Sustituir la IP del ejemplo por
@@ -182,7 +185,10 @@ $pin = (Get-Content .\signer-certificate-sha256.txt -Raw).Trim()
 Get-Service PuniShellAgent
 ```
 
-Antes, crear licencia y código de activación en el panel. La CA HTTPS y la
+Antes, importar en el panel la licencia firmada del proveedor; el operador
+técnico crea el código de activación. Copiar previamente `license-public.json`
+a `/etc/punishell/` con lectura para el usuario `punishell`. La herramienta
+`punishell-license` y su clave privada permanecen exclusivamente en el proveedor. La CA HTTPS y la
 confianza del certificado de firma del EXE son independientes. No incluir claves
 privadas del servidor ni del editor dentro de un ZIP o de GitHub Releases.
 

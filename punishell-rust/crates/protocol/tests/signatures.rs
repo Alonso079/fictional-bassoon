@@ -261,3 +261,20 @@ fn bitlocker_contract_uses_explicit_non_secret_fields() {
     assert_eq!(value["parameters"]["mount_point"], "C:");
     assert!(value.get("recovery_key").is_none());
 }
+
+#[test]
+fn pilot_wipe_is_typed_and_retired_remote_actions_are_rejected() {
+    let action = Action::WipeData {
+        authorized_path: LAB_WIPE_PATH.into(),
+    };
+    assert_eq!(action.required_feature(), Feature::WipeData);
+    let json = serde_json::to_value(&action).unwrap();
+    assert_eq!(json["type"], "wipe_data");
+    assert_eq!(serde_json::from_value::<Action>(json).unwrap(), action);
+    for raw in [
+        r#"{"type":"diagnostic_bundle","parameters":{"max_bytes":1024,"timeout_seconds":10}}"#,
+        r#"{"type":"restart_managed_service","parameters":{"service_name":"PuniShellAgent"}}"#,
+    ] {
+        assert!(serde_json::from_str::<Action>(raw).is_err());
+    }
+}

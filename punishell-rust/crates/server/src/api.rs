@@ -1,8 +1,7 @@
 use crate::{
     security,
     store::{
-        self, audit, current_license, rate, App, Error, Result, Session, COMMAND_KEY, LICENSE_KEY,
-        SERVER_KEY,
+        self, audit, current_license, rate, App, Error, Result, Session, COMMAND_KEY, SERVER_KEY,
     },
 };
 use axum::{
@@ -18,18 +17,19 @@ use ed25519_dalek::VerifyingKey;
 use punishell_domain::{
     authorize_approval, authorize_request, validate_command, CommandPolicy, CommandState, Role,
 };
-use punishell_licensing::{require_agent_capacity, require_feature, subscription_expires_at};
+use punishell_licensing::{
+    require_agent_capacity, require_feature, verify_license, LicenseContext, LicenseState,
+};
 use punishell_protocol::{
-    decrypt_payload, encrypt_payload, sign_command, sign_license, sign_payload, valid_id,
-    verify_payload, wire::*, Action, AgentWireEnvelope, CommandClaims, EncryptionDirection,
-    Feature, LicenseClaims, Purpose, SignedEnvelope, TrustStore, TrustedKey, PRODUCT,
-    PROTOCOL_VERSION,
+    decrypt_payload, encrypt_payload, sign_command, sign_payload, valid_id, verify_payload,
+    wire::*, Action, AgentWireEnvelope, CommandClaims, EncryptionDirection, Feature, Purpose,
+    SignedEnvelope, TrustStore, TrustedKey, PROTOCOL_VERSION,
 };
 use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
@@ -102,8 +102,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/v1/password/reset", post(reset_password))
         .route("/api/v1/users", get(users).post(create_user))
         .route("/api/v1/users/{id}/disable", post(disable_user))
-        .route("/api/v1/licenses", get(licenses).post(issue_license))
-        .route("/api/v1/licenses/{id}/revoke", post(revoke_license))
+        .route("/api/v1/licenses", get(licenses))
+        .route("/api/v1/licenses/import", post(import_license))
         .route("/api/v1/activation-codes", post(activation_code))
         .route("/api/v1/enrollment/start", post(enrollment_start))
         .route("/api/v1/agent", post(device))
@@ -219,7 +219,13 @@ async fn session(app: &App, headers: &HeaderMap, write: bool) -> Result<Session>
     })
 }
 fn admin(s: &Session) -> Result<()> {
-    if s.role != Role::Administrator {
+    if s.role != Role::PlatformAdministrator {
+        return Err(Error::Forbidden);
+    }
+    Ok(())
+}
+fn technical(s: &Session) -> Result<()> {
+    if s.role != Role::TechnicalOperator {
         return Err(Error::Forbidden);
     }
     Ok(())
@@ -330,7 +336,7 @@ async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<Respo
 async fn me(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<Json<Value>> {
     let s = session(&app, &headers, false).await?;
     Ok(Json(
-        json!({"id":s.user_id,"tenant_id":s.tenant_id,"role":format!("{:?}",s.role).to_lowercase(),"csrf":s.csrf}),
+        json!({"id":s.user_id,"tenant_id":s.tenant_id,"role":s.role,"csrf":s.csrf}),
     ))
 }
 #[derive(Deserialize)]
@@ -363,7 +369,7 @@ pub async fn add_user(
     audit(
         &mut tx,
         tenant,
-        "administrator",
+        "platform_administrator",
         "user_created",
         &user,
         Utc::now().timestamp(),
@@ -541,57 +547,49 @@ async fn reset_password(
     Ok(Json(json!({"ok":true})))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IssueLicense {
-    months: u32,
-    plan: String,
-    max_agents: u32,
-    features: BTreeSet<Feature>,
-    offline_grace_hours: u16,
-}
-async fn issue_license(
+async fn import_license(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Json(input): Json<IssueLicense>,
+    Json(envelope): Json<SignedEnvelope>,
 ) -> Result<Json<Value>> {
     let s = session(&app, &headers, true).await?;
     admin(&s)?;
     let now = Utc::now();
-    if !valid_id(&input.plan)
-        || input.max_agents == 0
-        || input.max_agents > 10000
-        || input.features.is_empty()
-        || input.offline_grace_hours > 72
-    {
-        return Err(Error::Invalid("licencia"));
+    let (claims, state) = verify_license(
+        &envelope,
+        &app.license_trust,
+        &LicenseContext {
+            tenant_id: &s.tenant_id,
+            now,
+            online: true,
+            revoked: false,
+            last_trusted_online: None,
+        },
+    )?;
+    if state != LicenseState::Active {
+        return Err(Error::Forbidden);
     }
-    let claims = LicenseClaims {
-        protocol_version: PROTOCOL_VERSION,
-        license_id: security::id(),
-        tenant_id: s.tenant_id.clone(),
-        product: PRODUCT.into(),
-        plan: input.plan,
-        features: input.features,
-        max_agents: input.max_agents,
-        issued_at: now,
-        expires_at: subscription_expires_at(now, input.months)?,
-        offline_grace_hours: input.offline_grace_hours,
-    };
-    let envelope = sign_license(&claims, LICENSE_KEY, &app.license_key)?;
     let mut tx = app.pool.begin().await?;
+    let latest: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(issued_at) FROM licenses WHERE tenant_id=?")
+            .bind(&s.tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if latest.is_some_and(|at| at >= claims.issued_at.timestamp()) {
+        return Err(Error::Conflict);
+    }
     sqlx::query("INSERT INTO licenses(id,tenant_id,envelope,issued_at) VALUES(?,?,?,?)")
         .bind(&claims.license_id)
         .bind(&s.tenant_id)
         .bind(serde_json::to_string(&envelope)?)
-        .bind(now.timestamp())
+        .bind(claims.issued_at.timestamp())
         .execute(&mut *tx)
         .await?;
     audit(
         &mut tx,
         &s.tenant_id,
         &s.user_id,
-        "license_issued",
+        "license_imported",
         &claims.license_id,
         now.timestamp(),
     )
@@ -599,40 +597,42 @@ async fn issue_license(
     tx.commit().await?;
     Ok(Json(json!({"claims":claims,"envelope":envelope})))
 }
+fn license_state_name(state: LicenseState) -> &'static str {
+    match state {
+        LicenseState::Active => "active",
+        LicenseState::Expired => "expired",
+        LicenseState::Revoked => "revoked",
+        LicenseState::GracePeriod { .. } => "grace",
+    }
+}
 async fn licenses(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<Json<Value>> {
     let s = session(&app, &headers, false).await?;
-    let rows=sqlx::query("SELECT id,envelope,revoked FROM licenses WHERE tenant_id=? ORDER BY issued_at DESC,rowid DESC LIMIT 100").bind(s.tenant_id).fetch_all(&app.pool).await?;
-    Ok(Json(json!(rows.iter().map(|r|json!({"id":r.get::<String,_>("id"),"envelope":serde_json::from_str::<Value>(r.get("envelope")).unwrap_or(Value::Null),"revoked":r.get::<bool,_>("revoked")})).collect::<Vec<_>>())))
-}
-async fn revoke_license(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<Value>> {
-    let s = session(&app, &headers, true).await?;
-    admin(&s)?;
-    let mut tx = app.pool.begin().await?;
-    let n = sqlx::query("UPDATE licenses SET revoked=1 WHERE id=? AND tenant_id=?")
-        .bind(&id)
-        .bind(&s.tenant_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    if n != 1 {
-        return Err(Error::Conflict);
+    let rows=sqlx::query("SELECT id,envelope,revoked FROM licenses WHERE tenant_id=? ORDER BY issued_at DESC,rowid DESC LIMIT 100").bind(&s.tenant_id).fetch_all(&app.pool).await?;
+    let mut items = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let envelope: SignedEnvelope = serde_json::from_str(row.get("envelope"))?;
+        let revoked: bool = row.get("revoked");
+        let verified = verify_license(
+            &envelope,
+            &app.license_trust,
+            &LicenseContext {
+                tenant_id: &s.tenant_id,
+                now: Utc::now(),
+                online: true,
+                revoked,
+                last_trusted_online: None,
+            },
+        );
+        let (claims, state) = match verified {
+            Ok((claims, state)) => (json!(claims), license_state_name(state)),
+            Err(_) => (Value::Null, "invalid"),
+        };
+        items.push(
+            json!({"id":row.get::<String,_>("id"),"claims":claims,"envelope":envelope,
+            "revoked":revoked,"current":index==0,"state":state}),
+        );
     }
-    sqlx::query("UPDATE commands SET state='cancelled' WHERE tenant_id=? AND state IN ('pending','approved')").bind(&s.tenant_id).execute(&mut *tx).await?;
-    audit(
-        &mut tx,
-        &s.tenant_id,
-        &s.user_id,
-        "license_revoked",
-        &id,
-        Utc::now().timestamp(),
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(Json(json!({"ok":true})))
+    Ok(Json(json!(items)))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -645,7 +645,7 @@ async fn activation_code(
     Json(input): Json<CodeOptions>,
 ) -> Result<Json<Value>> {
     let s = session(&app, &headers, true).await?;
-    admin(&s)?;
+    technical(&s)?;
     let now = Utc::now();
     if !(1..=1440).contains(&input.ttl_minutes) {
         return Err(Error::Invalid("TTL"));
@@ -1379,7 +1379,7 @@ async fn acknowledge_incident(
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     let s = session(&app, &headers, true).await?;
-    if !matches!(s.role, Role::Administrator | Role::Operator) {
+    if s.role != Role::TechnicalOperator {
         return Err(Error::Forbidden);
     }
     let now = Utc::now().timestamp();
@@ -1475,13 +1475,13 @@ async fn overview(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<Jso
     .await?
     {
         let envelope: SignedEnvelope = serde_json::from_str(row.get("envelope"))?;
-        let claims: LicenseClaims = verify_payload(
-            &envelope,
-            Purpose::License,
-            &app.license_trust,
-            Utc::now(),
-        )?;
-        json!({"plan":claims.plan,"expires_at":claims.expires_at,"max_agents":claims.max_agents,"revoked":row.get::<bool,_>("revoked")})
+        let revoked: bool = row.get("revoked");
+        match verify_license(&envelope, &app.license_trust, &LicenseContext {
+            tenant_id: &s.tenant_id, now: Utc::now(), online: true, revoked, last_trusted_online: None,
+        }) {
+            Ok((claims, state)) => json!({"plan":claims.plan,"expires_at":claims.expires_at,"max_agents":claims.max_agents,"revoked":revoked,"state":license_state_name(state)}),
+            Err(_) => json!({"state":"invalid","revoked":revoked}),
+        }
     } else {
         Value::Null
     };
@@ -1574,7 +1574,7 @@ async fn revoke_agent(
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     let s = session(&app, &headers, true).await?;
-    admin(&s)?;
+    technical(&s)?;
     let mut tx = app.pool.begin().await?;
     if sqlx::query("UPDATE agents SET revoked=1 WHERE id=? AND tenant_id=?")
         .bind(&id)
@@ -1668,6 +1668,9 @@ async fn approve_action(
     Json(input): Json<Approval>,
 ) -> Result<Json<Value>> {
     let mut s = session(&app, &headers, true).await?;
+    if s.role != Role::Approver {
+        return Err(Error::Forbidden);
+    }
     let now = Utc::now();
     rate(&app, &format!("mfa:{}", s.user_id), 5, 300, now.timestamp()).await?;
     let mut tx = app.pool.begin().await?;
@@ -1737,6 +1740,7 @@ async fn cancel_action(
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     let s = session(&app, &headers, true).await?;
+    authorize_request(&s.actor(), &s.tenant_id)?;
     end_action(&app, &s, &id, "cancelled", true).await
 }
 async fn end_action(
@@ -1788,7 +1792,7 @@ async fn audit_log(
     Query(page): Query<Page>,
 ) -> Result<Json<Value>> {
     let s = session(&app, &headers, false).await?;
-    if !matches!(s.role, Role::Administrator | Role::Auditor) {
+    if !matches!(s.role, Role::PlatformAdministrator | Role::Auditor) {
         return Err(Error::Forbidden);
     }
     let rows=sqlx::query("SELECT id,actor,event,object_id,at,previous_hash,hash FROM audit WHERE tenant_id=? ORDER BY id DESC LIMIT 100 OFFSET ?").bind(s.tenant_id).bind(page.offset.unwrap_or(0)).fetch_all(&app.pool).await?;

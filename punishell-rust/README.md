@@ -21,9 +21,9 @@ distribución es servidor Linux x64 y agente Windows x64.
 | `agent` | Enrolamiento, diario SQLite, check-in firmado, ejecución tipada, recuperación de recibos y actualización. |
 | `windows-platform` | DPAPI, red/WLAN/WTS/WMI, bloqueo de sesión, SCM y WinVerifyTrust/Authenticode. |
 
-No hay shell remoto genérico. El panel permite inventario, diagnóstico limitado,
-bloqueo de estación, reinicio de servicios permitidos, actualización aprobada
-y rotación de identidad. Las acciones administrativas exigen operador solicitante,
+No hay shell remoto genérico. El panel permite inventario, bloqueo de estación,
+WIPE de laboratorio, actualización aprobada y rotación de identidad. Las acciones
+administrativas exigen un solicitante,
 aprobador distinto con TOTP y licencia activa. El agente sólo ejecuta comandos
 firmados, para su tenant e identidad, dentro de 5 minutos y una sola vez.
 
@@ -45,7 +45,8 @@ final. Para la primera inicialización, `state-dir` y `config` no deben existir:
   --state-dir /var/lib/punishell/state \
   --public-url https://mdm.example.org \
   --certificate /etc/punishell/fullchain.pem \
-  --private-key /etc/punishell/privkey.pem
+  --private-key /etc/punishell/privkey.pem \
+  --license-public-key /etc/punishell/license-public.json
 ```
 
 El comando pide la contraseña inicial (mínimo 14 caracteres) y presenta **una sola
@@ -59,6 +60,102 @@ escucha sólo en `127.0.0.1:8443`: ajustar `bind` y red/proxy TLS según el ento
 ```bash
 ./target/release/punishell-server serve --config /var/lib/punishell/server.json
 ```
+
+## Licencias del proveedor y seis roles
+
+La emisión se realiza **fuera del servidor cliente** con `punishell-license`,
+una herramienta del crate `licensing` que no se incluye en el paquete del servidor:
+
+```bash
+cargo build --release -p punishell-licensing --bin punishell-license --locked
+# En la máquina privada del proveedor, una vez:
+./target/release/punishell-license init \
+  --key /ruta/privada/license.key --public-key /ruta/publica/license-public.json
+# Emitir la suscripción contratada (25 equipos; un mes natural):
+./target/release/punishell-license issue \
+  --key /ruta/privada/license.key --tenant main --months 1 --max-agents 25 \
+  --features inventory,lock_workstation,wipe_data,updates,rotate_identity,manage_bit_locker \
+  --output /ruta/entrega/licencia.json
+```
+
+Entregar `license-public.json` por un canal confiable para el `init` del servidor,
+y `licencia.json` al administrador de plataforma para **Verificar e importar**.
+`POST /api/v1/licenses/import` recibe el sobre JSON firmado; comprueba firma,
+tenant, producto, vigencia y que la emisión sea posterior a la instalada. No
+acepta reimportaciones ni retrocesos. La vista Licencias muestra estado, cupos y
+vencimiento. Se eliminaron los endpoints de emisión y revocación locales.
+`trust.json` conserva la clave pública del proveedor y las raíces públicas de
+servidor, comandos y actualizaciones; nunca contiene claves privadas.
+
+| Rol | Permisos de escritura / lectura especial |
+| --- | --- |
+| `security_observer` | Dashboard, inventario e incidencias; solo lectura |
+| `requester` | Solicitar y cancelar sus órdenes |
+| `approver` | Aprobar con TOTP nuevo o rechazar órdenes |
+| `technical_operator` | Códigos de activación, revocar agentes y reconocer incidencias |
+| `auditor` | Consultar auditoría inmutable |
+| `platform_administrator` | Gestionar usuarios e importar licencias; consultar auditoría |
+
+Todos los roles autenticados pueden leer dashboard, agentes e incidencias de su
+tenant. El administrador no hereda los permisos de solicitante ni de operador
+técnico. La separación Maker-Checker, CSRF y MFA se mantienen.
+
+### Actualizar una instalación existente
+
+Detener el servidor y respaldar su estado antes de desplegar los binarios nuevos.
+El servidor rechaza el arranque si encuentra `state/license.key`. Transferir esa
+clave a la custodia privada del proveedor y retirarla del cliente conservando su
+clave pública en `trust.json`. Si la clave estuvo bajo control del cliente,
+rotarla en el proveedor y distribuir la nueva raíz pública a servidor y agentes;
+las licencias anteriores necesitarán reemisión bajo esa nueva raíz. No ejecutar
+`init` sobre el estado existente ni eliminar la base de datos.
+
+La migración automática `0007_formal_roles.sql` convierte `administrator` a
+`platform_administrator` y `operator` a `requester`; mantiene aprobadores y
+auditores. Conserva identidades, hashes, MFA, sesiones y referencias de órdenes
+e incidencias, y verifica las claves foráneas antes del commit. Crear las cuentas
+adicionales de operador técnico y observador desde el panel o `add-user`.
+
+Actualizar servidor y agentes juntos: las órdenes remotas `diagnostic_bundle`
+y `restart_managed_service` se rechazan. Los indicadores antiguos `diagnostics`
+y `manage_services` se conservan solo para leer licencias firmadas existentes y
+no habilitan ninguna acción. `managed_services` en configuraciones anteriores
+se acepta por compatibilidad y ya no autoriza reinicios.
+
+## WIPE del piloto y bloqueo sin conexión
+
+`wipe_data` exige la prestación `wipe_data`, solicitud y aprobación independiente.
+Su único parámetro válido es `authorized_path: "C:\\PuniShell_Lab_Data"`. Solo
+elimina archivos regulares situados directamente en esa carpeta; no formatea,
+no realiza borrado seguro criptográfico y no recorre subcarpetas. Rechaza otras
+rutas, enlaces y junctions. El resultado se reporta y registra en la auditoría
+habitual de órdenes. Si el sistema de archivos falla durante el borrado puede
+haber eliminación parcial; se reporta fallo y no se repite automáticamente.
+
+Crear la carpeta de prueba desde PowerShell elevado y protegerla antes de usarla:
+
+```powershell
+New-Item -ItemType Directory -Path 'C:\PuniShell_Lab_Data'
+icacls.exe 'C:\PuniShell_Lab_Data' /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
+Set-Content -LiteralPath 'C:\PuniShell_Lab_Data\prueba.txt' -Value 'Datos de ensayo'
+```
+
+El agente tiene un Dead Man's Switch con `dead_man_seconds` en `agent.json`:
+por defecto **259200 segundos (72 horas)**; para la presentación usar **120**.
+El instalador admite `-DeadManSeconds 120`. El rango permitido es 60–259200.
+El último contacto autenticado queda persistido en `journal.db`; reiniciar el
+servicio no reinicia el plazo. También utiliza tiempo monotónico durante la
+ejecución y bloquea preventivamente si el reloj retrocede antes del último
+contacto. Revisa el plazo antes de cada petición y durante las esperas de reintento.
+Las peticiones HTTPS tienen un timeout de 30 segundos.
+
+Al vencer el plazo bloquea la sesión interactiva mediante el mecanismo nativo
+existente (el servicio invoca el proceso que llama `LockWorkStation`). Mientras
+continúe sin contacto, reintenta como máximo una vez por minuto; un fallo de
+bloqueo no detiene el agente. Registra `dead_man_lock` y su resultado en el log
+operativo local. Un contacto válido restablece el temporizador; no desbloquea
+la sesión automáticamente. En Linux las operaciones de bloqueo y WIPE devuelven
+`WindowsRequired`; comprobar su efecto real en Windows antes del despliegue.
 
 ## Laboratorio sin DNS: dirección IP manual
 
@@ -107,7 +204,8 @@ Desde `punishell-rust/`, después de compilar, inicializar con esa misma URL:
   --state-dir "$lab_dir/state" \
   --public-url https://192.168.1.50:8443 \
   --certificate "$lab_dir/server.pem" \
-  --private-key "$lab_dir/server.key"
+  --private-key "$lab_dir/server.key" \
+  --license-public-key /ruta/recibida/license-public.json
 ```
 
 Antes de ejecutar `serve`, editar **sólo** `bind` en el `server.json` generado
@@ -185,8 +283,8 @@ limpieza ocurre dentro de la misma transacción del heartbeat. Un equipo se marc
 `offline` después de 15 minutos. Estos umbrales operativos son del prototipo y
 deben alinearse con el intervalo real de polling antes de producción.
 
-Las acciones continúan siendo tipadas: inventario, diagnóstico limitado,
-bloqueo de estación, reinicio de servicios permitidos, actualización y rotación
+Las acciones continúan siendo tipadas: inventario, bloqueo de estación,
+WIPE de laboratorio, actualización y rotación
 de identidad. BitLocker permite únicamente reanudar protectores existentes en
 una unidad validada (`C:`–`Z:`); no inicia cifrado, no suspende protección y no
 crea ni lee claves. No se añadió ejecución arbitraria. Solicitud y aprobación siguen
@@ -207,8 +305,8 @@ En esta primera versión, las reglas son fijas:
 - `bitlocker_unprotected`: algún volumen reporta protección `off`, crítica.
 
 La evaluación corre dentro del mantenimiento cada minuto. Una incidencia activa
-se actualiza sin duplicarse y mantiene su reconocimiento. Operadores y
-administradores pueden reconocerla; todos los roles autenticados pueden leer
+se actualiza sin duplicarse y mantiene su reconocimiento. Solo el operador
+técnico puede reconocerla; todos los roles autenticados pueden leer
 las incidencias de su tenant. Reconocer no ejecuta acciones ni prueba recuperación.
 No se permite cerrar manualmente una incidencia como si se hubiese reparado.
 
@@ -318,9 +416,9 @@ escrow separado, almacenamiento cifrado con acceso de emergencia, rotación,
 auditoría específica y pruebas en hardware Windows con TPM; no debe mezclarse
 con el inventario periódico.
 
-En el panel HTTPS, iniciar sesión como `admin`, crear cuentas separadas de
-`operator` y `approver`, emitir una licencia de `6` meses, con las prestaciones
-y cupo deseados, y generar un código de activación. El código tiene un solo uso
+En el panel HTTPS, iniciar sesión como `admin`, importar la licencia firmada
+entregada por el proveedor y crear cuentas separadas de `requester`, `approver`
+y `technical_operator`. El operador técnico genera el código de activación. El código tiene un solo uso
 y TTL elegido (1–1440 minutos); el período de seis meses corresponde a la
 licencia, no al código. El servidor también soporta CLI `add-user`, `add-tenant`,
 `reset-password`, `publish-update` y `verify-audit` (`--help` en cada comando).

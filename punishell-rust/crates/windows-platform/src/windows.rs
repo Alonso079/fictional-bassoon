@@ -758,10 +758,6 @@ fn service(name: &str, start: bool) -> Result<()> {
         "servicio no alcanzó estado esperado".into(),
     ))
 }
-pub fn restart_service(name: &str) -> Result<()> {
-    service(name, false)?;
-    service(name, true)
-}
 pub fn stop_agent_service() -> Result<()> {
     service("PuniShellAgent", false)
 }
@@ -823,4 +819,75 @@ pub fn verify_authenticode(path: &Path, certificate: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Pilot-only WIPE. The directory handle prevents replacement of the lab root
+/// while deleting. Never recurse into directories or follow reparse points.
+pub fn wipe_lab_data(authorized_path: &str) -> Result<u64> {
+    if authorized_path != punishell_protocol::LAB_WIPE_PATH {
+        return Err(PlatformError::Other(
+            "WIPE solo permite la carpeta de laboratorio".into(),
+        ));
+    }
+    wipe_lab_directory(Path::new(authorized_path))
+}
+
+fn wipe_lab_directory(root: &Path) -> Result<u64> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    let pin = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(root)?;
+    let metadata = pin.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(PlatformError::Other(
+            "la carpeta WIPE no puede ser un enlace o junction".into(),
+        ));
+    }
+    // Lab files must be placed directly inside the fixed directory. Validate the
+    // entire list first so unsupported contents fail without partial deletion.
+    let files = std::fs::read_dir(root)?
+        .map(|entry| {
+            let path = entry?.path();
+            let metadata = path.symlink_metadata()?;
+            if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(std::io::Error::other(
+                    "WIPE solo admite archivos regulares en la raíz del laboratorio",
+                ));
+            }
+            Ok(path)
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut deleted = 0;
+    for path in files {
+        std::fs::remove_file(path)?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
+#[cfg(test)]
+mod wipe_tests {
+    use super::*;
+    #[test]
+    fn lab_wipe_deletes_only_regular_files_and_retains_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("test-one.txt"), "fixture").unwrap();
+        std::fs::write(root.path().join("test-two.txt"), "fixture").unwrap();
+        assert_eq!(wipe_lab_directory(root.path()).unwrap(), 2);
+        assert!(root.path().is_dir());
+        assert_eq!(wipe_lab_directory(root.path()).unwrap(), 0);
+    }
+    #[test]
+    fn lab_wipe_rejects_subdirectories_before_deleting_anything() {
+        let root = tempfile::tempdir().unwrap();
+        let regular = root.path().join("keep.txt");
+        std::fs::write(&regular, "fixture").unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        assert!(wipe_lab_directory(root.path()).is_err());
+        assert_eq!(std::fs::read_to_string(regular).unwrap(), "fixture");
+        assert!(wipe_lab_data(r"C:\Windows").is_err());
+    }
 }

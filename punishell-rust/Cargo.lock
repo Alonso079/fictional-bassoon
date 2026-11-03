@@ -1616,6 +1616,7 @@ version = "0.1.1"
 dependencies = [
  "chrono",
  "punishell-protocol",
+ "serde",
  "thiserror",
 ]
 
@@ -1623,9 +1624,14 @@ dependencies = [
 name = "punishell-licensing"
 version = "0.1.1"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
+ "clap",
+ "ed25519-dalek",
  "punishell-protocol",
+ "serde_json",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

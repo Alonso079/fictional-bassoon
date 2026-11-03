@@ -17,6 +17,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 pub mod wire;
 
+pub const LAB_WIPE_PATH: &str = r"C:\PuniShell_Lab_Data";
+
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_PAYLOAD_BYTES: usize = 16 * 1024;
 pub const MAX_ENCRYPTED_BYTES: usize = 32 * 1024;
@@ -27,6 +29,7 @@ pub const PRODUCT: &str = "punishell-mdm";
 pub enum Feature {
     Inventory,
     LockWorkstation,
+    WipeData,
     Diagnostics,
     ManageServices,
     Updates,
@@ -44,20 +47,10 @@ pub enum Feature {
 pub enum Action {
     CollectInventory,
     LockWorkstation,
-    DiagnosticBundle {
-        max_bytes: u32,
-        timeout_seconds: u16,
-    },
-    RestartManagedService {
-        service_name: String,
-    },
-    RequestUpdate {
-        channel: String,
-    },
+    WipeData { authorized_path: String },
+    RequestUpdate { channel: String },
     RotateAgentKey,
-    ResumeBitLockerProtection {
-        mount_point: String,
-    },
+    ResumeBitLockerProtection { mount_point: String },
 }
 
 impl Action {
@@ -65,8 +58,7 @@ impl Action {
         match self {
             Self::CollectInventory => Feature::Inventory,
             Self::LockWorkstation => Feature::LockWorkstation,
-            Self::DiagnosticBundle { .. } => Feature::Diagnostics,
-            Self::RestartManagedService { .. } => Feature::ManageServices,
+            Self::WipeData { .. } => Feature::WipeData,
             Self::RequestUpdate { .. } => Feature::Updates,
             Self::RotateAgentKey => Feature::RotateIdentity,
             Self::ResumeBitLockerProtection { .. } => Feature::ManageBitLocker,

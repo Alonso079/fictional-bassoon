@@ -55,6 +55,8 @@ pub struct Config {
     pub public_url: String,
     pub tls_certificate: PathBuf,
     pub tls_private_key: PathBuf,
+    /// Legacy configuration input; remote service management is no longer supported.
+    #[serde(default)]
     pub managed_services: BTreeSet<String>,
     pub update_channels: BTreeSet<String>,
 }
@@ -62,7 +64,6 @@ pub struct App {
     pub pool: SqlitePool,
     pub config: Config,
     pub command_key: SigningKey,
-    pub license_key: SigningKey,
     pub server_key: SigningKey,
     pub update_key: SigningKey,
     pub encryption_key: [u8; 32],
@@ -74,7 +75,7 @@ pub const COMMAND_KEY: &str = "command-v1";
 pub const LICENSE_KEY: &str = "license-v1";
 pub const SERVER_KEY: &str = "server-v1";
 pub const UPDATE_KEY: &str = "update-v1";
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
 pub struct MaintenanceReport {
@@ -157,8 +158,21 @@ impl App {
         }
         let command_key =
             SigningKey::from_bytes(&read_secret(&config.state_dir.join("command.key"))?);
-        let license_key =
-            SigningKey::from_bytes(&read_secret(&config.state_dir.join("license.key"))?);
+        // Licensing private keys belong only to the provider's offline tool.
+        if config.state_dir.join("license.key").exists() {
+            return Err(Error::Invalid(
+                "retirar license.key del servidor cliente; conservarla en el proveedor",
+            ));
+        }
+        let roots: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.state_dir.join("trust.json"))?)?;
+        let license_root: PublicKeyConfig = serde_json::from_value(
+            roots
+                .get("license")
+                .cloned()
+                .ok_or(Error::Invalid("trust.json requiere clave pública license"))?,
+        )?;
+        let license_trust = trust(&[license_root])?;
         let server_key =
             SigningKey::from_bytes(&read_secret(&config.state_dir.join("server.key"))?);
         let update_key =
@@ -263,16 +277,48 @@ impl App {
         let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
             .fetch_one(&pool)
             .await?;
+        if version == 6 {
+            // SQLite table rebuild: disable FK enforcement outside the transaction,
+            // then verify every reference before committing. Pool has one connection.
+            sqlx::query("PRAGMA foreign_keys=OFF")
+                .execute(&pool)
+                .await?;
+            let migration: Result<()> = async {
+                let mut tx = pool.begin().await?;
+                sqlx::raw_sql(include_str!("../migrations/0007_formal_roles.sql"))
+                    .execute(&mut *tx)
+                    .await?;
+                if !sqlx::query("PRAGMA foreign_key_check")
+                    .fetch_all(&mut *tx)
+                    .await?
+                    .is_empty()
+                {
+                    return Err(Error::Invalid(
+                        "referencias inválidas en migración de roles",
+                    ));
+                }
+                sqlx::query("INSERT INTO schema_version VALUES (7)")
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                Ok(())
+            }
+            .await;
+            sqlx::query("PRAGMA foreign_keys=ON").execute(&pool).await?;
+            migration?;
+        }
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&pool)
+            .await?;
         if version != SCHEMA_VERSION {
             return Err(Error::Invalid("versión DB incompatible"));
         }
-        let license_trust = trust(&[public_config(LICENSE_KEY, &license_key)])?;
+
         let dummy_hash = security::password_hash(&security::token())?;
         Ok(Arc::new(Self {
             pool,
             config,
             command_key,
-            license_key,
             server_key,
             update_key,
             encryption_key,
@@ -354,8 +400,10 @@ impl Session {
 }
 pub fn role(value: &str) -> Result<Role> {
     match value {
-        "administrator" => Ok(Role::Administrator),
-        "operator" => Ok(Role::Operator),
+        "platform_administrator" => Ok(Role::PlatformAdministrator),
+        "security_observer" => Ok(Role::SecurityObserver),
+        "requester" => Ok(Role::Requester),
+        "technical_operator" => Ok(Role::TechnicalOperator),
         "approver" => Ok(Role::Approver),
         "auditor" => Ok(Role::Auditor),
         _ => Err(Error::Invalid("rol")),

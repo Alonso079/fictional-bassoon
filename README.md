@@ -81,8 +81,8 @@ El workspace Rust se divide por responsabilidades:
    con TOTP y firma del servidor. El agente comprueba destino, vigencia y nonce.
 
 No existe un shell remoto genérico en la arquitectura Rust. Las operaciones son
-un conjunto cerrado de acciones: inventario, diagnóstico limitado, bloqueo de
-estación, reinicio de servicios permitidos, actualización, rotación de identidad
+un conjunto cerrado de acciones: inventario, bloqueo de estación, WIPE de
+laboratorio, actualización, rotación de identidad
 y reanudación controlada de protectores BitLocker.
 
 ## Uso del prototipo
@@ -120,7 +120,8 @@ cargo build --release -p punishell-server --locked
   --state-dir /var/lib/punishell/state \
   --public-url https://mdm.example.org \
   --certificate /etc/punishell/fullchain.pem \
-  --private-key /etc/punishell/privkey.pem
+  --private-key /etc/punishell/privkey.pem \
+  --license-public-key /etc/punishell/license-public.json
 ```
 
 `init` solicita una contraseña de al menos 14 caracteres y muestra una sola vez
@@ -142,12 +143,16 @@ curl --fail https://mdm.example.org/health/live
 curl --fail https://mdm.example.org/health/ready
 ```
 
+La clave pública del proveedor y las instrucciones de emisión offline se describen
+en [el README técnico](punishell-rust/README.md#licencias-del-proveedor-y-seis-roles).
+La clave privada de licencias no se instala en el servidor cliente.
+
 ### 3. Preparar el panel
 
 1. Iniciar sesión como `admin` y registrar el TOTP.
-2. Crear cuentas separadas con roles `operator` y `approver`.
-3. Emitir una licencia con las prestaciones requeridas y cupo suficiente.
-4. Crear un código de activación de un solo uso.
+2. Crear cuentas separadas con roles `requester`, `approver` y `technical_operator`.
+3. Importar la licencia firmada entregada por PuniShell SpA.
+4. Como operador técnico, crear un código de activación de un solo uso.
 5. Copiar `state/trust.json` al equipo Windows mediante un canal confiable.
 
 ### 4. Compilar e instalar el agente Windows
